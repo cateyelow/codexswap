@@ -35,7 +35,10 @@ Homepage = "https://github.com/cateyelow/codexswap"
 Issues = "https://github.com/cateyelow/codexswap/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.5"]
+# ruff is pinned to a minor range on purpose: its rule codes get split and renamed
+# between minors (UP007 became UP007 + UP045 in 0.16), which silently turns a clean
+# local run into a red CI run.
+dev = ["pytest>=7.0", "ruff>=0.16,<0.17"]
 
 [tool.hatch.version]
 path = "src/codexswap/__init__.py"
@@ -53,8 +56,9 @@ target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
-# UP006/UP007/UP035: we deliberately keep typing.Optional / typing.List rather than
-# PEP 585 and PEP 604 syntax. Every module uses `from __future__ import annotations`,
-# so both forms are valid in annotations, but the typing.* spelling also stays correct
-# in the runtime-evaluated positions this codebase uses on Python 3.9.
-ignore = ["E501", "UP006", "UP007", "UP035"]
+# UP006/UP007/UP045/UP035: we deliberately keep typing.Optional / typing.List rather
+# than PEP 585 and PEP 604 syntax. Every module uses `from __future__ import
+# annotations`, so both forms are valid in annotations, but the typing.* spelling also
+# stays correct in the runtime-evaluated positions this codebase uses on Python 3.9.
+# These codes match the pinned ruff minor; see the dev extra above.
+ignore = ["E501", "UP006", "UP007", "UP045", "UP035"]
