@@ -176,7 +176,7 @@ def render_status(account, usage, *, active_slot, color, now=None) -> str:
     ))
 
 
-def render_reset_list(slot, credits, *, color, now=None) -> str:
+def render_reset_list(slot, credits, *, color, now=None, summary=True) -> str:
     now = time.time() if now is None else now
     credits = list(credits)
     if not credits:
@@ -189,7 +189,10 @@ def render_reset_list(slot, credits, *, color, now=None) -> str:
             format_ts(credit.expires_at), _relative(credit.expires_at, now, compact_days=True),
             _ascii(credit.id[:20]),
         ))
-    rows.append(f"  {sum(credit.is_available for credit in credits)} available")
+    if summary:
+        # Suppressed when the caller is showing one chosen credit, where a count
+        # of that single item would read as the account total.
+        rows.append(f"  {sum(credit.is_available for credit in credits)} available")
     return "\n".join(rows)
 
 

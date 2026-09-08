@@ -354,7 +354,8 @@ def _reset(args, store, settings, color):
     output = sys.stderr if args.json else sys.stdout
     print("{}redeem credit for slot {}:".format("would " if args.dry_run else "", account.slot),
           file=output)
-    print(render.render_reset_list(account.slot, [credit], color=color, now=now), file=output)
+    print(render.render_reset_list(account.slot, [credit], color=color, now=now,
+                                   summary=False), file=output)
     if args.dry_run:
         if args.json:
             _print_json({"slot": account.slot, "creditId": credit.id,

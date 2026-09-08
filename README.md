@@ -32,13 +32,12 @@ pipx install codexswap
 pip install codexswap
 ```
 
-From source, download and extract the repository's
-[source archive](https://github.com/cateyelow/codexswap/archive/refs/heads/main.zip),
-then run:
+From source:
 
 ```sh
-cd codexswap-main
-uv tool install .
+git clone https://github.com/cateyelow/codexswap.git
+cd codexswap
+uv tool install .          # Or: pip install -e ".[dev]" for a development checkout.
 ```
 
 ## Quick start

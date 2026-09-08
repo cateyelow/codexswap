@@ -1,0 +1,8 @@
+# Normalise line endings so the repository is byte-identical on every platform.
+* text=auto eol=lf
+
+# Never rewrite these.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
