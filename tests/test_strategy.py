@@ -168,3 +168,42 @@ def test_rotate_next_returns_none_for_empty_or_current_only():
     assert strategy.rotate_next([], None) is None
     assert strategy.rotate_next([candidate(1, 0).account], 1) is None
     assert strategy.rotate_next([candidate(2, 0, disabled=True).account], 1) is None
+
+
+def model_candidate(slot, percent, model_percent, *, models=()):
+    """A candidate whose aggregate and named-model usage disagree."""
+    from codexswap.models import PerLimitUsage
+
+    base = candidate(slot, percent)
+    snapshot = replace(base.snapshot, per_limit=(PerLimitUsage(
+        limit_id="codex_bengalfox", limit_name="GPT-5.3-Codex-Spark",
+        primary=RateLimitWindow(model_percent, 300, NOW + 86400),
+        secondary=None, plan_type="pro",
+    ),))
+    return strategy.Candidate(base.account, snapshot, models)
+
+
+def test_candidate_percent_defaults_to_the_aggregate():
+    assert model_candidate(2, 30, 99).percent == 30
+
+
+def test_candidate_percent_follows_the_named_model():
+    assert model_candidate(2, 30, 99, models=("codex_bengalfox",)).percent == 99
+
+
+def test_candidate_percent_is_unknown_without_a_snapshot():
+    assert strategy.Candidate(candidate(2, 30).account, None, ("codex_bengalfox",)).percent is None
+
+
+def test_an_exhausted_model_makes_a_candidate_ineligible():
+    free = model_candidate(2, 30, 5, models=("codex_bengalfox",))
+    busy = model_candidate(3, 5, 99, models=("codex_bengalfox",))
+
+    assert pick([busy, free]) is free.account
+
+
+def test_the_same_pair_picks_the_other_way_without_the_model():
+    free = model_candidate(2, 30, 5)
+    busy = model_candidate(3, 5, 99)
+
+    assert pick([busy, free]) is busy.account

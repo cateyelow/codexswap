@@ -213,7 +213,8 @@ def tick(
         else:
             store.record_usage(active_account.slot, active_snapshot)
             state.unhealthy[active_account.slot] = 0
-            active_percent = active_snapshot.binding_percent
+            # A named model can be exhausted while the totals still look fine.
+            active_percent = active_snapshot.percent_for(settings.models)
 
     # 5. Only known usage below the threshold establishes that we can stay idle.
     if (active_account is not None and active_percent is not None
@@ -237,7 +238,7 @@ def tick(
                 continue
             store.record_usage(account.slot, snapshot)
             state.unhealthy[account.slot] = 0
-        candidates.append(strategy.Candidate(account, snapshot))
+        candidates.append(strategy.Candidate(account, snapshot, settings.models))
     # CONTRACT: the reset policy asks whether another account still has headroom,
     # which is the plain threshold. Hysteresis is a switch-target rule, and applying it
     # here spent a credit while an account at 75% sat idle under a threshold of 80.
@@ -379,6 +380,7 @@ def run(
     dry_run: bool = False,
     interval: Optional[int] = None,
     threshold: Optional[int] = None,
+    models: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> int:
     """The daemon loop: one implementation, so a fix here cannot miss a second copy."""
@@ -396,6 +398,8 @@ def run(
             settings.set("autoswitch.intervalSeconds", str(interval))
         if threshold is not None:
             settings.set("autoswitch.threshold", str(threshold))
+        if models is not None:
+            settings.set("autoswitch.model", models)
         return settings
 
     try:

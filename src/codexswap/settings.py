@@ -58,6 +58,10 @@ SPECS: Dict[str, SettingSpec] = {
             "Switch away after this many consecutive failures to probe an account.",
         ),
         SettingSpec(
+            "autoswitch.model", "str", "", None, None, None,
+            "Also weigh these per-model limits, comma separated; empty uses the totals.",
+        ),
+        SettingSpec(
             "reset.policy", "str", "expiring", ("never", "expiring", "exhausted", "always"),
             None, None, "Choose when automatic checks may redeem a reset credit.",
         ),
@@ -244,6 +248,12 @@ class Settings:
     @property
     def unhealthy_ticks(self) -> int:
         return self.get("autoswitch.unhealthyTicks")
+
+    @property
+    def models(self) -> Tuple[str, ...]:
+        """The per-model limits that selection must respect, in written order."""
+        raw = self.get("autoswitch.model")
+        return tuple(part.strip() for part in raw.split(",") if part.strip())
 
     @property
     def enabled(self) -> bool:

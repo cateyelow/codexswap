@@ -424,6 +424,7 @@ are non-default. `config` prints `key  value  (default)` aligned.
 | `autoswitch.hysteresisPct` | int | `10` | 0..50 |
 | `autoswitch.strategy` | str | `best` | `best` or `next-available` |
 | `autoswitch.unhealthyTicks` | int | `3` | 1..20 |
+| `autoswitch.model` | str | `` | any comma separated list |
 | `reset.policy` | str | `expiring` | `never`, `expiring`, `exhausted`, `always` |
 | `reset.expiryDays` | int | `3` | 0..30 |
 | `reset.minUsagePercent` | int | `50` | 0..100 |
@@ -639,6 +640,18 @@ def rotate_next(accounts: Sequence[Account], current_slot: Optional[int]) -> Opt
 - `rotate_next` ignores usage entirely and is what a bare `codexswap switch` uses when
   no strategy is given.
 
+A candidate's `percent` is `snapshot.percent_for(candidate.models)`: the aggregate
+windows when no model is named, otherwise the worse of the aggregate and every
+selected entry of `rateLimitsByLimitId`. Names match `limitId` or `limitName`
+case-insensitively and `all` selects every reported entry; a name the account does
+not report contributes nothing, so an account that never ran the model is judged on
+its totals alone. Models come from `--model` when given and `autoswitch.model`
+otherwise, and `--model ""` restores the totals for one run.
+
+The reset policy deliberately keeps using `binding_percent`. A credit clears the
+account-wide windows, so an exhausted model must not on its own authorise spending
+one while the totals are low.
+
 The CLI's strategy switch uses `switcher.pick_target`, which applies the above
 strategy to eligible non-API accounts first, then API-key accounts if none qualify.
 This includes ordinary accounts with unknown usage. Bare rotation and explicit
@@ -665,7 +678,7 @@ codexswap help
 codexswap version
 codexswap list [--json] [--token-status] [--no-probe]      (alias: ls)
 codexswap status [--json]                                  (alias: current, st)
-codexswap switch [<ref>] [--strategy best|next-available] [--force] [--json]
+codexswap switch [<ref>] [--strategy best|next-available] [--model NAMES] [--force] [--json]
 codexswap add [--slot N] [--alias NAME]
 codexswap add-token [TOKEN|-] [--slot N] [--email EMAIL] [--alias NAME]
 codexswap sync-config [<ref>] [--from PATH] [--force]
@@ -684,7 +697,7 @@ codexswap unmap [path]
 codexswap probe [<ref>] [--backend] [--json]
 codexswap reset [list] [--json]
 codexswap reset use [<ref>] [--credit ID] [--yes] [--dry-run]
-codexswap auto [--once] [--dry-run] [--interval N] [--threshold N]
+codexswap auto [--once] [--dry-run] [--interval N] [--threshold N] [--model NAMES]
 codexswap config [set <KEY> <VALUE> | unset <KEY>] [--json]
 codexswap export <path> [--account <ref>]
 codexswap import <path> [--force]
@@ -707,8 +720,10 @@ Behaviour notes:
 - `add` reads the live `~/.codex/auth.json`, derives identity, and copies it into the
   next free slot (or `--slot`). Re-adding an email that already exists updates that slot
   in place instead of creating a duplicate.
-- `switch` with no `<ref>` and no `--strategy` rotates to the next slot. With
-  `--strategy` it uses `strategy.pick_target`. Before overwriting the live auth it
+- `switch` with no `<ref>`, no `--strategy`, and no `--model` rotates to the next
+  slot. With either flag it uses `strategy.pick_target`; `--model` alone selects with
+  the saved `autoswitch.strategy`, because weighing a model only means something
+  while choosing by usage. An explicit `<ref>` still wins over both. Before overwriting the live auth it
   copies the live `auth.json` back into the slot it belongs to, so token refreshes done
   by the live session are not lost.
 - `switch` refuses when a Codex process is running unless `--force`, printing the pids.

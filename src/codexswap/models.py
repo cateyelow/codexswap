@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 HEALTH_OK = "ok"
 HEALTH_EXPIRED = "expired"
@@ -243,6 +243,30 @@ class UsageSnapshot:
             if window is not None and window.used_percent is not None
         )
         return max(percentages) if percentages else None
+
+    def percent_for(self, models: Sequence[str] = ()) -> Optional[float]:
+        """Effective usage when specific models matter.
+
+        Codex reports one aggregate pair of windows plus a per-model breakdown in
+        `rateLimitsByLimitId`. A model can be exhausted while the aggregate still
+        looks fine, so selecting for a model takes the worse of the two rather than
+        switching to an account that cannot run the model you asked for. Names match
+        `limitId` or `limitName` case-insensitively; "all" selects every entry. An
+        empty selection is the aggregate alone, which is the default everywhere.
+        """
+        percentages = [self.binding_percent]
+        wanted = {name.strip().casefold() for name in models if name and name.strip()}
+        if wanted:
+            for limit in self.per_limit:
+                names = {limit.limit_id.casefold(), (limit.limit_name or "").casefold()}
+                if "all" not in wanted and not (names & wanted):
+                    continue
+                percentages.extend(
+                    window.used_percent for window in (limit.primary, limit.secondary)
+                    if window is not None
+                )
+        known = [value for value in percentages if value is not None]
+        return max(known) if known else None
 
     @property
     def available_reset_credits(self) -> Tuple[ResetCredit, ...]:

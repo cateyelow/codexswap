@@ -16,6 +16,7 @@ CONTRACT_SPECS = (
     ("autoswitch.hysteresisPct", "int", 10, None, 0, 50),
     ("autoswitch.strategy", "str", "best", ("best", "next-available"), None, None),
     ("autoswitch.unhealthyTicks", "int", 3, None, 1, 20),
+    ("autoswitch.model", "str", "", None, None, None),
     ("reset.policy", "str", "expiring", ("never", "expiring", "exhausted", "always"), None, None),
     ("reset.expiryDays", "int", 3, None, 0, 30),
     ("reset.minUsagePercent", "int", 50, None, 0, 100),
@@ -44,10 +45,14 @@ TYPED_PROPERTIES = (
     ("ui_color", "ui.color", "never"),
 )
 
+# `models` parses its stored string into a tuple instead of returning it, so the
+# identity assertions below cannot cover it. Its own tests do.
+DERIVED_PROPERTIES = ("models",)
+
 
 def test_specs_have_exactly_the_contract_keys_in_order():
     assert tuple(SPECS) == tuple(row[0] for row in CONTRACT_SPECS)
-    assert len(SPECS) == 15
+    assert len(SPECS) == 16
 
 
 @pytest.mark.parametrize("key,kind,default,choices,minimum,maximum", CONTRACT_SPECS)
@@ -107,7 +112,7 @@ def test_set_coerces_every_boolean_token_case_insensitively(key, raw, expected):
 @pytest.mark.parametrize(
     "key,choice",
     [(key, choice) for key, kind, _, choices, _, _ in CONTRACT_SPECS
-     if kind == "str" for choice in choices],
+     if kind == "str" and choices is not None for choice in choices],
 )
 def test_set_accepts_every_string_choice(key, choice):
     settings = Settings.load()
@@ -227,7 +232,7 @@ def test_unset_restores_default_and_repeating_it_is_a_noop(swap_home):
 def test_property_table_covers_every_typed_property():
     assert {name for name, value in vars(Settings).items() if isinstance(value, property)} == {
         name for name, _, _ in TYPED_PROPERTIES
-    }
+    } | set(DERIVED_PROPERTIES)
 
 
 @pytest.mark.parametrize("name,key,raw", TYPED_PROPERTIES)
@@ -239,3 +244,37 @@ def test_typed_property_agrees_with_get_before_and_after_override(name, key, raw
     value = settings.set(key, raw)
     assert getattr(settings, name) == settings.get(key) == value
     assert type(getattr(settings, name)) is type(value)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("", ()),
+    ("codex", ("codex",)),
+    ("  codex  ", ("codex",)),
+    ("codex,codex_bengalfox", ("codex", "codex_bengalfox")),
+    ("codex , , codex_bengalfox ,", ("codex", "codex_bengalfox")),
+    ("all", ("all",)),
+])
+def test_models_splits_and_trims_the_stored_list(raw, expected):
+    settings = Settings.load()
+    settings.set("autoswitch.model", raw)
+
+    assert settings.models == expected
+
+
+def test_models_keeps_the_written_order():
+    settings = Settings.load()
+    settings.set("autoswitch.model", "b,a,c")
+
+    assert settings.models == ("b", "a", "c")
+
+
+def test_models_is_empty_by_default():
+    assert Settings.load().models == ()
+
+
+@pytest.mark.parametrize("raw", ["", "codex", "a,b,c", "GPT-5.3-Codex-Spark", "all"])
+def test_set_accepts_any_string_for_a_free_form_setting(raw):
+    settings = Settings.load()
+
+    assert settings.set("autoswitch.model", raw) == raw
+    assert settings.get("autoswitch.model") == raw

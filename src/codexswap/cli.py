@@ -81,6 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
     child = command("switch", "Activate an account, or rotate to the next account")
     child.add_argument("ref", nargs="?", help="slot, alias, email, or unique email prefix")
     child.add_argument("--strategy", choices=("best", "next-available"))
+    child.add_argument("--model", metavar="NAMES",
+                       help="also weigh these per-model limits (comma separated, or all)")
     child.add_argument("--force", action="store_true", help="allow switching while Codex is running")
     _json_flag(child)
     child = command("add", "Capture the current Codex login")
@@ -148,6 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("--dry-run", action="store_true")
     child.add_argument("--interval", type=int, metavar="N")
     child.add_argument("--threshold", type=int, metavar="N")
+    child.add_argument("--model", metavar="NAMES",
+                       help="also weigh these per-model limits (comma separated, or all)")
     child = command("config", "Show or change configuration settings")
     _json_flag(child)
     config_commands = child.add_subparsers(dest="config_command", metavar="ACTION")
@@ -347,24 +351,37 @@ def _show_accounts(args, store, settings, color):
     return 0
 
 
+def _selected_models(args, settings) -> Tuple[str, ...]:
+    """--model for this run, otherwise autoswitch.model."""
+    raw = getattr(args, "model", None)
+    if raw is None:
+        return settings.models
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def _switch(args, store, settings):
     from . import strategy, switcher
 
+    # Weighing a model only means something while choosing by usage, so asking for
+    # one selects rather than rotates. The saved strategy decides how.
+    selection = args.strategy or (settings.strategy if args.model is not None else None)
     if args.ref is not None:
         # CONTRACT: an explicit ref selects the requested account directly.
         target = store.resolve(args.ref)
-    elif args.strategy is None:
+    elif selection is None:
         target = strategy.rotate_next(store.ordered(), store.active_slot)
     else:
         accounts = store.enabled_accounts()
         usages = _probe_all(store, settings, accounts=accounts)
-        candidates = [strategy.Candidate(account, usages[account.slot][0]) for account in accounts]
+        models = _selected_models(args, settings)
+        candidates = [strategy.Candidate(account, usages[account.slot][0], models)
+                      for account in accounts]
         target = switcher.pick_target(candidates, current_slot=store.active_slot,
-                                      strategy=args.strategy, threshold=settings.threshold,
+                                      strategy=selection, threshold=settings.threshold,
                                       hysteresis=settings.hysteresis_pct)
     if target is None:
         reason = "no other enabled account is available"
-        if args.strategy is not None:
+        if selection is not None:
             reason += f" at or below {settings.threshold - settings.hysteresis_pct}% usage (threshold minus hysteresis)"
         if not store.accounts:
             reason = "no accounts configured; run: codexswap add"
@@ -664,7 +681,8 @@ def _dispatch(args, parser):
         from . import auto
 
         return auto.run(once=args.once, dry_run=args.dry_run, interval=args.interval,
-                                 threshold=args.threshold, log=print)
+                        threshold=args.threshold, models=getattr(args, "model", None),
+                        log=print)
     color = render.supports_color(sys.stdout, "never" if args.no_color else settings.ui_color)
     store = AccountStore.load()
     if args.command == "add-token":

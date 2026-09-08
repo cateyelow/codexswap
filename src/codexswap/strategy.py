@@ -6,7 +6,7 @@ from __future__ import annotations
 # ruff: noqa: UP007
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from .errors import UserError
 from .models import Account, UsageSnapshot
@@ -16,10 +16,15 @@ from .models import Account, UsageSnapshot
 class Candidate:
     account: Account
     snapshot: Optional[UsageSnapshot]
+    # Empty means the aggregate windows, which is what every caller wants until the
+    # user names a model. See UsageSnapshot.percent_for.
+    models: Tuple[str, ...] = ()
 
     @property
     def percent(self) -> Optional[float]:
-        return self.snapshot.binding_percent if self.snapshot is not None else None
+        if self.snapshot is None:
+            return None
+        return self.snapshot.percent_for(self.models)
 
 
 def eligible(

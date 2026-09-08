@@ -223,3 +223,96 @@ def test_fetched_at_is_preserved():
     snap = models.UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=123.5)
     assert snap.fetched_at == 123.5
     assert time.time() > 0  # sanity, keeps the import meaningful
+
+
+def _with_limits(*limits) -> models.UsageSnapshot:
+    """A snapshot whose aggregate is 10% and whose per-model entries are given."""
+    return models.UsageSnapshot(
+        fetched_at=NOW, account_id="acct", plan_type="pro",
+        primary=models.RateLimitWindow(10.0, 10080, None), secondary=None,
+        has_credits=False, credits_balance=None, reset_credits=(),
+        per_limit=tuple(
+            models.PerLimitUsage(
+                limit_id=limit_id, limit_name=limit_name,
+                primary=models.RateLimitWindow(primary, 300, None) if primary is not None else None,
+                secondary=(models.RateLimitWindow(secondary, 10080, None)
+                           if secondary is not None else None),
+                plan_type="pro",
+            )
+            for limit_id, limit_name, primary, secondary in limits
+        ),
+    )
+
+
+def test_percent_for_without_models_is_the_aggregate():
+    snap = snapshot()
+
+    assert snap.percent_for() == snap.binding_percent == 84.0
+    assert snap.percent_for(()) == 84.0
+
+
+def test_percent_for_takes_the_worse_of_aggregate_and_selected_model():
+    snap = _with_limits(("codex_bengalfox", "GPT-5.3-Codex-Spark", 97.0, 40.0))
+
+    assert snap.percent_for() == 10.0
+    assert snap.percent_for(["codex_bengalfox"]) == 97.0
+
+
+def test_percent_for_keeps_the_aggregate_when_the_model_is_idle():
+    snap = _with_limits(("codex_bengalfox", "GPT-5.3-Codex-Spark", 0.0, 0.0))
+
+    assert snap.percent_for(["codex_bengalfox"]) == 10.0
+
+
+def test_percent_for_matches_limit_name_case_insensitively():
+    snap = _with_limits(("codex_bengalfox", "GPT-5.3-Codex-Spark", 91.0, None))
+
+    assert snap.percent_for(["gpt-5.3-codex-spark"]) == 91.0
+    assert snap.percent_for(["CODEX_BENGALFOX"]) == 91.0
+
+
+def test_percent_for_ignores_models_the_account_does_not_report():
+    snap = _with_limits(("codex_bengalfox", "GPT-5.3-Codex-Spark", 97.0, None))
+
+    assert snap.percent_for(["codex_nonesuch"]) == 10.0
+
+
+def test_percent_for_all_selects_every_reported_model():
+    snap = _with_limits(
+        ("codex", None, 5.0, None),
+        ("codex_bengalfox", "GPT-5.3-Codex-Spark", 93.0, None),
+    )
+
+    assert snap.percent_for(["all"]) == 93.0
+
+
+def test_percent_for_takes_the_worst_of_several_selected_models():
+    snap = _with_limits(
+        ("codex_a", None, 30.0, None),
+        ("codex_b", None, 88.0, None),
+        ("codex_c", None, 99.0, None),
+    )
+
+    assert snap.percent_for(["codex_a", "codex_b"]) == 88.0
+
+
+def test_percent_for_considers_both_windows_of_a_selected_model():
+    snap = _with_limits(("codex_bengalfox", None, 20.0, 95.0))
+
+    assert snap.percent_for(["codex_bengalfox"]) == 95.0
+
+
+def test_percent_for_reports_unknown_when_nothing_has_a_percent():
+    snap = models.UsageSnapshot(
+        fetched_at=NOW, account_id=None, plan_type=None, primary=None, secondary=None,
+        has_credits=False, credits_balance=None, reset_credits=(),
+        per_limit=(models.PerLimitUsage("codex_bengalfox", None, None, None, None),),
+    )
+
+    assert snap.percent_for(["codex_bengalfox"]) is None
+
+
+def test_percent_for_ignores_blank_names():
+    snap = _with_limits(("codex_bengalfox", "GPT-5.3-Codex-Spark", 97.0, None))
+
+    assert snap.percent_for(["", "   "]) == 10.0

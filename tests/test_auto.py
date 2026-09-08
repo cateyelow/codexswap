@@ -8,7 +8,7 @@ import pytest
 from conftest import RATE_LIMITS_RESULT, make_auth
 
 from codexswap import auto, errors
-from codexswap.models import RateLimitWindow, UsageSnapshot
+from codexswap.models import PerLimitUsage, RateLimitWindow, UsageSnapshot
 from codexswap.settings import Settings
 from codexswap.store import AccountStore
 
@@ -318,3 +318,75 @@ def test_journal_records_the_attempt_before_the_request_leaves(scenario, swap_ho
         scenario.tick(now=NOW, journal=auto.RedemptionJournal(scenario.state))
     assert [entry["outcome"] for entry in recorded[0]] == ["pending"]
     assert auto.AutoState.load().redeemed_last_24h(NOW) == 1
+
+
+def model_usage(percent, model_percent, *, limit_id="codex_bengalfox"):
+    """A snapshot whose aggregate and named-model usage differ."""
+    snapshot = usage(percent)
+    return replace(snapshot, per_limit=(
+        PerLimitUsage(
+            limit_id=limit_id, limit_name="GPT-5.3-Codex-Spark",
+            primary=RateLimitWindow(model_percent, 300, int(NOW + DAY)),
+            secondary=None, plan_type="pro",
+        ),
+    ))
+
+
+def test_exhausted_model_switches_an_account_that_looks_idle_in_total(scenario):
+    scenario.settings.set("autoswitch.model", "codex_bengalfox")
+    scenario.snapshots[1] = model_usage(20, 95)
+    scenario.snapshots[2] = model_usage(30, 5)
+
+    result = scenario.tick(now=NOW)
+
+    assert result.action == "switched"
+    assert scenario.activated == [2]
+
+
+def test_the_same_account_stays_idle_without_the_model_setting(scenario):
+    scenario.snapshots[1] = model_usage(20, 95)
+    scenario.snapshots[2] = model_usage(30, 5)
+
+    assert scenario.tick(now=NOW).action == "idle"
+    assert scenario.activated == []
+
+
+def test_a_candidate_whose_model_is_exhausted_is_not_a_target(scenario):
+    scenario.settings.set("autoswitch.model", "codex_bengalfox")
+    scenario.snapshots[1] = model_usage(90, 90)
+    scenario.snapshots[2] = model_usage(5, 99)
+
+    result = scenario.tick(now=NOW)
+
+    assert result.action == "no-target"
+    assert scenario.activated == []
+
+
+def test_model_names_may_be_written_as_a_list(scenario):
+    scenario.settings.set("autoswitch.model", "codex_nonesuch, GPT-5.3-Codex-Spark")
+    scenario.snapshots[1] = model_usage(20, 95)
+    scenario.snapshots[2] = model_usage(30, 5)
+
+    assert scenario.tick(now=NOW).action == "switched"
+
+
+def test_an_unreported_model_leaves_the_totals_in_charge(scenario):
+    scenario.settings.set("autoswitch.model", "codex_nonesuch")
+    scenario.snapshots[1] = model_usage(20, 95)
+
+    assert scenario.tick(now=NOW).action == "idle"
+
+
+def test_model_selection_does_not_change_the_reset_decision(scenario):
+    # A credit clears the account-wide windows, so an exhausted model must not by
+    # itself authorise spending one while the totals are still low.
+    scenario.settings.set("reset.policy", "always")
+    scenario.settings.set("reset.minUsagePercent", "50")
+    scenario.settings.set("autoswitch.model", "codex_bengalfox")
+    scenario.snapshots[1] = model_usage(20, 95)
+    scenario.snapshots[2] = model_usage(30, 5)
+
+    result = scenario.tick(now=NOW)
+
+    assert scenario.redeemed == []
+    assert result.action == "switched"

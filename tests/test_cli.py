@@ -21,6 +21,7 @@ COMMAND_ARGV = [
     ["status", "--json"], ["current"], ["st"],
     ["switch"], ["switch", "2", "--force", "--json"],
     ["switch", "--strategy", "best"], ["switch", "--strategy", "next-available"],
+    ["switch", "--model", "all"], ["switch", "--strategy", "best", "--model", "codex"],
     ["add"], ["add", "--slot", "2", "--alias", "work"],
     ["remove", "2"], ["rm", "2"], ["disable", "2"], ["enable", "2"],
     ["alias"], ["alias", "2", "work"], ["alias", "2", "--unset"],
@@ -32,6 +33,7 @@ COMMAND_ARGV = [
     ["reset"], ["reset", "--json"], ["reset", "list"], ["reset", "list", "--json"],
     ["reset", "use"], ["reset", "use", "2", "--credit", "fixture-credit", "--yes", "--dry-run"],
     ["auto"], ["auto", "--once", "--dry-run", "--interval", "60", "--threshold", "80"],
+    ["auto", "--model", "codex,codex_bengalfox"],
     ["config"], ["config", "--json"],
     ["config", "set", "autoswitch.threshold", "70", "--json"],
     ["config", "unset", "autoswitch.threshold", "--json"],
@@ -335,3 +337,78 @@ def test_legacy_console_encoding_does_not_fail_a_successful_mutation(
     assert AccountStore.load().get(1).alias == "\U0001f98a"
     # The name itself cannot survive CP949; an escape is the honest rendering.
     assert r"\U0001f98a" in printed
+
+
+def _model_snapshot(percent, model_percent):
+    """A cached snapshot whose totals and named-model usage disagree."""
+    from codexswap.models import PerLimitUsage, RateLimitWindow
+
+    return replace(
+        UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW),
+        primary=RateLimitWindow(percent, 10080, int(NOW + 86400)), secondary=None,
+        per_limit=(PerLimitUsage(
+            limit_id="codex_bengalfox", limit_name="GPT-5.3-Codex-Spark",
+            primary=RateLimitWindow(model_percent, 300, int(NOW + 86400)),
+            secondary=None, plan_type="pro",
+        ),),
+    )
+
+
+@pytest.fixture
+def model_store():
+    """Three enabled accounts: slot 2 has the model exhausted, slot 3 does not."""
+    store = AccountStore.load()
+    for slot, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+        store.add_from_auth(make_auth(email=email, account_id=f"acct-{slot}",
+                                      id_exp=int(NOW + 3600), access_exp=int(NOW + 86400)),
+                            now=NOW)
+    store.set_active(1)
+    store.record_usage(1, _model_snapshot(90, 90))
+    store.record_usage(2, _model_snapshot(5, 99))
+    store.record_usage(3, _model_snapshot(20, 1))
+    return store
+
+
+def test_switch_model_avoids_the_account_whose_model_is_exhausted(model_store, live_auth):
+    assert cli.main(["switch", "--model", "codex_bengalfox"]) == 0
+
+    assert AccountStore.load().active_slot == 3
+
+
+def test_switch_without_model_prefers_the_lowest_total(model_store, live_auth):
+    assert cli.main(["switch", "--strategy", "best"]) == 0
+
+    assert AccountStore.load().active_slot == 2
+
+
+def test_switch_model_reads_the_saved_setting(model_store, live_auth):
+    settings = cli.Settings.load()
+    settings.set("autoswitch.model", "codex_bengalfox")
+    settings.save()
+
+    assert cli.main(["switch", "--strategy", "best"]) == 0
+
+    assert AccountStore.load().active_slot == 3
+
+
+def test_switch_model_overrides_the_saved_setting(model_store, live_auth):
+    settings = cli.Settings.load()
+    settings.set("autoswitch.model", "codex_bengalfox")
+    settings.save()
+
+    # An empty --model asks for the totals alone, undoing the stored preference.
+    assert cli.main(["switch", "--strategy", "best", "--model", ""]) == 0
+
+    assert AccountStore.load().active_slot == 2
+
+
+def test_bare_switch_still_rotates_without_reading_usage(model_store, live_auth):
+    assert cli.main(["switch"]) == 0
+
+    assert AccountStore.load().active_slot == 2
+
+
+def test_switch_model_still_honours_an_explicit_ref(model_store, live_auth):
+    assert cli.main(["switch", "2", "--model", "codex_bengalfox"]) == 0
+
+    assert AccountStore.load().active_slot == 2

@@ -116,7 +116,7 @@ so it never silently transfers to whichever account lands in that slot next.
 | `codexswap version` | Print the installed version. |
 | `codexswap list [--json] [--token-status] [--no-probe]` | List accounts and usage; optionally show derived token health or use cached data only (alias: `ls`). |
 | `codexswap status [--json]` | Show the active account (aliases: `current`, `st`). |
-| `codexswap switch [<ref>] [--strategy best\|next-available] [--force] [--json]` | Activate an account, select by usage strategy, or rotate to the next slot when neither is given. |
+| `codexswap switch [<ref>] [--strategy best\|next-available] [--model NAMES] [--force] [--json]` | Activate an account, select by usage strategy, or rotate to the next slot when none is given. |
 | `codexswap add [--slot N] [--alias NAME]` | Save the live login in a slot; re-adding an existing email updates its slot. |
 | `codexswap add-token [TOKEN\|-] [--slot N] [--email EMAIL] [--alias NAME]` | Register an API key from stdin, an inline argument, or a hidden prompt. |
 | `codexswap sync-config [<ref>] [--from PATH] [--force]` | Seed or explicitly update slot config files; report differing copies. |
@@ -135,7 +135,7 @@ so it never silently transfers to whichever account lands in that slot next.
 | `codexswap probe [<ref>] [--backend] [--json]` | Probe usage for the selected account. |
 | `codexswap reset [list] [--json]` | List the active account's banked reset credits. |
 | `codexswap reset use [<ref>] [--credit ID] [--yes] [--dry-run]` | Redeem a reset credit with confirmation, or preview the redemption. |
-| `codexswap auto [--once] [--dry-run] [--interval N] [--threshold N]` | Run automatic monitoring, optionally for one tick or without switching or redeeming. |
+| `codexswap auto [--once] [--dry-run] [--interval N] [--threshold N] [--model NAMES]` | Run automatic monitoring, optionally for one tick or without switching or redeeming. |
 | `codexswap config [set <KEY> <VALUE> \| unset <KEY>] [--json]` | Show settings, set a validated value, or restore a default. |
 | `codexswap export <path> [--account <ref>]` | Export all accounts or one account, including credentials. |
 | `codexswap import <path> [--force]` | Import accounts, remapping occupied slots unless overwrite is explicitly forced. |
@@ -249,6 +249,30 @@ the lowest usage, breaking ties by lowest slot number. `next-available` walks sl
 order from the current account and wraps around. Unknown usage is eligible but
 ranks last under `best`.
 
+### Per-model limits
+
+Codex reports one aggregate pair of windows plus a per-model breakdown, so a single
+model can be exhausted while the totals still look idle. Name the models you care
+about and selection takes the worse of the two:
+
+```sh
+codexswap config set autoswitch.model GPT-5.3-Codex-Spark
+codexswap switch --model gpt-5.3-codex-spark      # one run, ignoring the saved value
+codexswap auto --model all                        # weigh every model the account reports
+```
+
+Names match the reported `limitId` or `limitName` and are case-insensitive; `all`
+selects every entry. A comma separated list takes the worst of the ones it names. A
+model an account does not report contributes nothing, so an account that has never
+run it is judged on its totals alone. Passing `--model ""` restores the totals for a
+single run. `codexswap switch --model NAMES` selects by usage using the saved
+`autoswitch.strategy` rather than rotating, since weighing a model only means
+something while choosing by usage.
+
+Reset credits are the exception. A credit clears the account-wide windows, so an
+exhausted model never on its own authorises spending one while the totals are low;
+`reset.minUsagePercent` keeps reading the binding total.
+
 API-key accounts are considered only after all ordinary candidates are ineligible,
 under both strategies. Their unavailable usage is a successful empty reading, so
 it does not accumulate authentication failures or permit reset redemption.
@@ -277,8 +301,8 @@ Dry runs perform reads and decisions, but neither switch accounts nor redeem
 credits, and they write nothing: `state.json` is neither created nor changed.
 
 A running `codexswap auto` re-reads its settings every tick, so `codexswap config set`
-takes effect without restarting it. Values passed as `--interval` or `--threshold` keep
-overriding the file.
+takes effect without restarting it. Values passed as `--interval`, `--threshold`, or
+`--model` keep overriding the file.
 
 An automatic switch rewrites the live credential file. Because the daemon is
 unattended, it does **not** apply the running-process guard that manual
@@ -369,6 +393,7 @@ codexswap config unset autoswitch.threshold
 | `autoswitch.hysteresisPct` | int | `10` | 0..50 | Percentage points below threshold required for a target with known usage. |
 | `autoswitch.strategy` | str | `best` | `best`, `next-available` | Choose the least-used eligible account or the next eligible slot. |
 | `autoswitch.unhealthyTicks` | int | `3` | 1..20 | Consecutive active-account probe failures before trying another account. |
+| `autoswitch.model` | str | `` | any comma separated list | Per-model limits to weigh alongside the totals; `all` selects every reported model. |
 | `reset.policy` | str | `expiring` | `never`, `expiring`, `exhausted`, `always` | Decide when auto mode may spend a banked reset. |
 | `reset.expiryDays` | int | `3` | 0..30 | Expiry horizon in days for the `expiring` policy. |
 | `reset.minUsagePercent` | int | `50` | 0..100 | Minimum binding usage for any policy-driven redemption. |
