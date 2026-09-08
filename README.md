@@ -120,7 +120,7 @@ so it never silently transfers to whichever account lands in that slot next.
 | `codexswap add [--slot N] [--alias NAME]` | Save the live login in a slot; re-adding an existing email updates its slot. |
 | `codexswap add-token [TOKEN\|-] [--slot N] [--email EMAIL] [--alias NAME]` | Register an API key from stdin, an inline argument, or a hidden prompt. |
 | `codexswap sync-config [<ref>] [--from PATH] [--force]` | Seed or explicitly update slot config files; report differing copies. |
-| `codexswap doctor [--json]` | Diagnose paths, Codex startup, account files, settings, locks, processes, and disk space. |
+| `codexswap doctor [--json]` | Diagnose paths, Codex startup, account files and whose account each slot really holds, settings, locks, processes, and disk space. |
 | `codexswap watch [--interval N]` | Refresh the account list until Ctrl+C; defaults to 30 seconds (5..3600). |
 | `codexswap upgrade [--yes] [--json]` | Detect uv/pipx/pip installation and confirm a self-upgrade. |
 | `codexswap remove <ref>` | Remove a saved account (alias: `rm`). |

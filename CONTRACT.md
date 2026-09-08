@@ -792,6 +792,9 @@ Exit codes come from the exception table in section 4; success is 0.
   resolved homes and writability (nearest existing parent for a missing home),
   Codex path and `--version`, app-server `initialize`, registry/account count,
   per-slot auth presence/parse/auth mode/offline health and POSIX permissions,
+  per-slot identity (`slot.N.identity`: the stored credential's account ID and
+  email against the registry entry, failing when either is known on both sides and
+  differs, so section 3.4's refusals have a command that explains them),
   live auth matching (account ID/email or exact private API-key comparison),
   settings shape/types/ranges and unknown keys, lock, processes, and free disk.
   Each subprocess version/initialize timeout is 5 seconds; both run in a throwaway

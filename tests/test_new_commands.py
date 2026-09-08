@@ -515,3 +515,47 @@ def test_new_parser_defaults():
     args = cli.build_parser().parse_args(["sync-config", "main", "--from", "source", "--force"])
     assert args.ref == "main" and args.source == Path("source") and args.force
     assert isinstance(cli.build_parser().parse_args(["doctor", "--json"]), argparse.Namespace)
+
+
+def test_doctor_reports_a_slot_holding_another_account(healthy_doctor):
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="a@example.com", account_id="acct-1"))
+    # Overwrite the slot credential with a different account, as a hand copy would.
+    paths.atomic_write_json(paths.slot_auth_path(1),
+                            make_auth(email="b@example.com", account_id="acct-2"))
+
+    checks = {item["name"]: item for item in doctor.collect_checks()["checks"]}
+
+    assert checks["slot.1.identity"]["status"] == "fail"
+    assert "different account" in checks["slot.1.identity"]["detail"]
+    assert "account id" in checks["slot.1.identity"]["detail"]
+
+
+def test_doctor_accepts_a_slot_holding_its_own_account(healthy_doctor):
+    AccountStore.load().add_from_auth(make_auth(email="a@example.com", account_id="acct-1"))
+
+    checks = {item["name"]: item for item in doctor.collect_checks()["checks"]}
+
+    assert checks["slot.1.identity"]["status"] == "ok"
+    assert checks["slot.1.identity"]["detail"] == "matches the registered account"
+
+
+def test_doctor_reports_an_email_change_on_the_same_slot(healthy_doctor):
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="a@example.com", account_id=""))
+    paths.atomic_write_json(paths.slot_auth_path(1),
+                            make_auth(email="b@example.com", account_id=""))
+
+    checks = {item["name"]: item for item in doctor.collect_checks()["checks"]}
+
+    assert checks["slot.1.identity"]["status"] == "fail"
+    assert "email differs" in checks["slot.1.identity"]["detail"]
+
+
+def test_doctor_has_no_identity_opinion_about_an_api_key_slot(healthy_doctor):
+    AccountStore.load().add_token("opaque-doctor-secret")
+
+    checks = {item["name"]: item for item in doctor.collect_checks()["checks"]}
+
+    assert checks["slot.1.identity"]["status"] == "ok"
+    assert "api key" in checks["slot.1.identity"]["detail"]

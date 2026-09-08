@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, appserver, errors, identity, locking, paths, switcher
 from .models import HEALTH_OK, Account
@@ -80,6 +80,27 @@ def _settings_checks(root: Path) -> List[Dict[str, str]]:
     checks.append({"name": "settings.unknown", "status": "warn" if unknown else "ok",
                    "detail": "unrecognised keys: " + ", ".join(sorted(unknown)) if unknown else "none"})
     return checks
+
+
+def _identity_match(account: Account, derived) -> Tuple[str, str]:
+    """Compare the slot's stored credential with the identity the registry records."""
+    registered = account.identity
+    if derived.auth_mode == "apikey" or registered.auth_mode == "apikey":
+        # API keys carry no account id and no email of their own.
+        return "ok", "api key; no identity to compare"
+    for field, label in (("account_id", "account id"), ("email", "email")):
+        mine = (getattr(derived, field) or "").strip()
+        theirs = (getattr(registered, field) or "").strip()
+        if not mine or not theirs:
+            continue
+        if field == "email":
+            mine, theirs = mine.casefold(), theirs.casefold()
+        if mine != theirs:
+            return "fail", (f"slot credential is a different account ({label} differs); "
+                            "re-add this account or remove the slot")
+    if not (derived.account_id or derived.email):
+        return "warn", "slot credential carries no identity to compare"
+    return "ok", "matches the registered account"
 
 
 def collect_checks() -> Dict[str, Any]:
@@ -159,6 +180,10 @@ def collect_checks() -> Dict[str, Any]:
             auths[account.slot] = auth
             add(name, "ok" if health == HEALTH_OK else "fail",
                 f"present, parses; auth_mode={derived.auth_mode}; health={health}")
+            # The registry entry is only a label. A credential copied in by hand, or a
+            # codex login run with CODEX_HOME pointed here, leaves it naming somebody
+            # else, and usage and reset credits would then be read for that person.
+            add(f"slot.{account.slot}.identity", *_identity_match(account, derived))
             if os.name != "nt":
                 mode = stat.S_IMODE(path.stat().st_mode)
                 add(f"slot.{account.slot}.mode", "warn" if mode & 0o077 else "ok",
