@@ -211,7 +211,10 @@ def tick(
             # CONTRACT: An unusable active account has effective usage 100%; no
             # fresh snapshot exists with which to decide on a reset credit.
         else:
-            store.record_usage(active_account.slot, active_snapshot)
+            # A dry run must leave no trace: a cached reading would let the next real
+            # tick skip its own probe, which is exactly "changing what happens next".
+            if not dry_run:
+                store.record_usage(active_account.slot, active_snapshot)
             state.unhealthy[active_account.slot] = 0
             # A named model can be exhausted while the totals still look fine.
             active_percent = active_snapshot.percent_for(settings.models)
@@ -236,7 +239,8 @@ def tick(
                 # CONTRACT: Failed probes are excluded; a successful probe with
                 # unknown usage is still eligible under the selection strategy.
                 continue
-            store.record_usage(account.slot, snapshot)
+            if not dry_run:
+                store.record_usage(account.slot, snapshot)
             state.unhealthy[account.slot] = 0
         candidates.append(strategy.Candidate(account, snapshot, settings.models))
     # CONTRACT: the reset policy asks whether another account still has headroom,
@@ -399,7 +403,10 @@ def run(
     def emit(result: TickResult, *, now: float) -> None:
         line = format_tick(result, now=now)
         log(line)
-        _append_log(line)
+        # The log is a record of what the daemon did. A dry run did nothing, and
+        # writing to a shared file is still writing.
+        if not dry_run:
+            _append_log(line)
 
     def overrides(settings: Settings) -> Settings:
         # Command-line values outrank the file on every reload, not just the first.

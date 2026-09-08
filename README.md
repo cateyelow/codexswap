@@ -298,7 +298,9 @@ codexswap auto --once --dry-run
 ```
 
 Dry runs perform reads and decisions, but neither switch accounts nor redeem
-credits, and they write nothing: `state.json` is neither created nor changed.
+credits, and they write nothing at all: not `state.json`, not the account registry,
+not the usage cache, and not the log. A preview that cached what it read would let
+the next real tick skip its own probe, so each dry tick probes afresh.
 
 A running `codexswap auto` re-reads its settings every tick, so `codexswap config set`
 takes effect without restarting it. Values passed as `--interval`, `--threshold`, or

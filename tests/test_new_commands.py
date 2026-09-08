@@ -559,3 +559,69 @@ def test_doctor_has_no_identity_opinion_about_an_api_key_slot(healthy_doctor):
 
     assert checks["slot.1.identity"]["status"] == "ok"
     assert "api key" in checks["slot.1.identity"]["detail"]
+
+
+def _home_census(base: Path) -> dict:
+    """Every file under the home with its digest, so any write at all is visible."""
+    import hashlib
+
+    return {
+        str(path.relative_to(base)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(base.rglob("*")) if path.is_file()
+    }
+
+
+def test_a_dry_run_writes_nothing_at_all(monkeypatch, capsys):
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="a@example.com", account_id="acct-1"))
+    store.add_from_auth(make_auth(email="b@example.com", account_id="acct-2"))
+    store.set_active(1)
+    settings = Settings.load()
+    settings.set("reset.policy", "never")
+    settings.save()
+
+    def probe(home, **kwargs):
+        slot = int(Path(home).name)
+        return UsageSnapshot.from_api(
+            {"rateLimits": {"primary": {"usedPercent": 95 if slot == 1 else 5}}},
+            fetched_at=cli.time.time(),
+        )
+
+    monkeypatch.setattr(appserver, "probe_usage", probe)
+    monkeypatch.setattr(switcher, "activate", Mock(side_effect=AssertionError("dry run switched")))
+    root = paths.codexswap_home()
+    before = _home_census(root)
+
+    assert cli.main(["auto", "--once", "--dry-run"]) == 0
+
+    assert "[dry-run] 1 -> 2" in capsys.readouterr().out
+    # Not state.json, not the registry, not the usage cache, and not the log.
+    assert _home_census(root) == before
+
+
+def test_a_real_run_does_record_what_it_read(monkeypatch, capsys):
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="a@example.com", account_id="acct-1"))
+    store.add_from_auth(make_auth(email="b@example.com", account_id="acct-2"))
+    store.set_active(1)
+    settings = Settings.load()
+    settings.set("reset.policy", "never")
+    settings.save()
+
+    def probe(home, **kwargs):
+        slot = int(Path(home).name)
+        return UsageSnapshot.from_api(
+            {"rateLimits": {"primary": {"usedPercent": 95 if slot == 1 else 5}}},
+            fetched_at=cli.time.time(),
+        )
+
+    monkeypatch.setattr(appserver, "probe_usage", probe)
+    monkeypatch.setattr(switcher, "activate", Mock())
+    root = paths.codexswap_home()
+    before = _home_census(root)
+
+    assert cli.main(["auto", "--once"]) == 0
+
+    written = set(_home_census(root)) - set(before)
+    # The comparison test above is only meaningful because a real run writes these.
+    assert {"usage-cache.json", "state.json", "codexswap.log"} <= written

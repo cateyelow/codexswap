@@ -626,9 +626,12 @@ Tick algorithm:
    return `("switched", ...)`.
 
 `dry_run` performs every read and decision but calls neither `redeemer` nor
-`activator`, and prefixes `detail` with `[dry-run] `. It also persists nothing: `run`
-skips `state.save()` entirely, so `state.json` is neither created nor modified by a
-dry run. "Show me what would happen" must not itself change what happens next.
+`activator`, and prefixes `detail` with `[dry-run] `. It writes nothing whatsoever:
+`run` skips `state.save()`, `tick` skips `store.record_usage`, and `emit` skips the
+log file, so `state.json`, `accounts.json`, `usage-cache.json` and `codexswap.log`
+are all left exactly as they were. "Show me what would happen" must not itself
+change what happens next, and a cached reading would let the next real tick skip
+its own probe. The cost is that consecutive dry ticks each probe afresh.
 
 `run` reloads `Settings` **and** the registry at the top of every tick, so that
 `config set` and switches made elsewhere take effect in a daemon that is already
