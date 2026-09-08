@@ -191,9 +191,15 @@ codexswap auto --once --dry-run
 ```
 
 Dry runs perform reads and decisions, but neither switch accounts nor redeem
-credits. An automatic switch changes the live credentials; it does not promise
-to migrate an already-running Codex session. The running-process guard still
-applies to switching.
+credits.
+
+An automatic switch rewrites the live credential file. Because the daemon is
+unattended, it does **not** apply the running-process guard that manual
+`codexswap switch` uses: it would otherwise stall forever whenever a Codex session
+was open. A Codex process that is already running keeps the credentials it loaded,
+so it is not migrated to the new account; the switch takes effect for sessions
+started afterwards. Use `codexswap run <ref>` when you want a session pinned to a
+specific account regardless of what auto mode does.
 
 **Linux: systemd user service.** Run this in Bash after installing `codexswap` and
 Codex. It writes a user unit with the executable paths and PATH from your current
