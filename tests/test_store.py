@@ -222,3 +222,54 @@ def test_existing_slot_mutators_reject_unknown_slot(method, args):
     with pytest.raises(errors.AccountNotFound):
         getattr(store, method)(*args)
     assert paths.accounts_path().read_bytes() == before
+
+
+def test_alias_must_identify_exactly_one_account():
+    store = AccountStore.load()
+    add_account(store, 1, alias="work")
+    second = add_account(store, 2)
+    with pytest.raises(errors.UserError, match="already used by slot 1"):
+        store.set_alias(second.slot, "WORK")
+    assert store.get(2).alias is None
+    # Re-setting an account's own alias is not a clash with itself.
+    store.set_alias(1, "work")
+    assert store.resolve("work").slot == 1
+
+
+def test_duplicate_alias_from_an_older_registry_is_reported_not_guessed():
+    store = AccountStore.load()
+    add_account(store, 1, alias="work")
+    add_account(store, 2)
+    # Written by a build that did not enforce uniqueness; taking the first match
+    # would switch, run or redeem against an account the user did not name.
+    registry = json.loads(paths.accounts_path().read_text(encoding="utf-8"))
+    for entry in registry["accounts"]:
+        entry["alias"] = "work"
+    paths.accounts_path().write_text(json.dumps(registry), encoding="utf-8")
+    reloaded = AccountStore.load()
+    with pytest.raises(errors.UserError, match="Ambiguous alias"):
+        reloaded.resolve("work")
+    assert reloaded.resolve("1").slot == 1
+
+
+def test_directory_mappings_follow_the_account_not_the_slot(tmp_path):
+    from codexswap import mappings
+
+    store = AccountStore.load()
+    add_account(store, 1)
+    add_account(store, 2)
+    first, second = tmp_path / "one", tmp_path / "two"
+    mappings.set_mapping(first, 1)
+    mappings.set_mapping(second, 2)
+
+    store.swap_slots(1, 2)
+    assert mappings.lookup(first) == 2
+    assert mappings.lookup(second) == 1
+
+    store.move_slot(2, 7)
+    assert mappings.lookup(first) == 7
+
+    store.remove(7)
+    # Not left pointing at 7: the next account added there would inherit the promise.
+    assert mappings.lookup(first) is None
+    assert mappings.lookup(second) == 1

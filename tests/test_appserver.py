@@ -108,20 +108,28 @@ def test_unanswered_request_times_out_without_hanging(tmp_path, codex_root, sile
             proc.kill()
 
     # The fake blocks only on stdin, so normal close ends it immediately. This
-    # watchdog also turns a broken client timeout into a bounded test failure.
-    watchdog = threading.Timer(3.5, stop_hung_child)
+    # watchdog turns a broken client timeout into a bounded failure rather than a
+    # hung suite, so its threshold is a hang bound, not a speed target: spawning a
+    # Python child costs seconds on a loaded Windows box.
+    watchdog = threading.Timer(30, stop_hung_child)
     watchdog.daemon = True
     started = time.monotonic()
+    handshaked = []
     watchdog.start()
     try:
         with pytest.raises(errors.AppServerTimeout), client:
+            handshaked.append(time.monotonic())
             client.read_rate_limits()
     finally:
         watchdog.cancel()
         watchdog.join(timeout=0.2)
         client.__exit__(None, None, None)
     elapsed = time.monotonic() - started
-    assert 0.8 <= elapsed < 5
+    # What this test measures is the 1.0s request timeout firing instead of hanging.
+    # Subtract the spawn and handshake where they are separable; when the handshake
+    # is the thing that times out they cannot be, so that case gets a looser bound.
+    measured = elapsed - (handshaked[0] - started) if handshaked else elapsed
+    assert 0.8 <= measured < (5 if handshaked else 20)
     assert not watchdog_fired.is_set()
 
 

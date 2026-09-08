@@ -116,9 +116,16 @@ class AccountStore:
         if number in self.accounts:
             return self.accounts[number]
         folded = value.casefold()
-        for account in self.ordered():
-            if account.alias is not None and account.alias.casefold() == folded:
-                return account
+        aliased = [account for account in self.ordered()
+                   if account.alias is not None and account.alias.casefold() == folded]
+        if len(aliased) == 1:
+            return aliased[0]
+        if aliased:
+            # set_alias refuses duplicates, but a registry written by an older build
+            # can still hold them. Silently taking the first would switch, run or
+            # redeem against an account the user did not name.
+            candidates = ", ".join(f"{a.slot}: {a.identity.label()}" for a in aliased)
+            raise errors.UserError("Ambiguous alias. Candidates: " + candidates)
         account = self.find_by_email(value)
         if account is not None:
             return account
@@ -265,6 +272,8 @@ class AccountStore:
             cache = self._read_usage_cache()
             cache.pop(str(slot), None)
             self._write_usage_cache(cache)
+            # A mapping left behind would point at whichever account reuses this slot.
+            self._remap_directories({slot: None})
             self.save()
             return account
 
@@ -272,6 +281,16 @@ class AccountStore:
         with FileLock(self._path(paths.lock_path())):
             self.reload()
             account = self.get(slot)
+            if alias is not None:
+                folded = alias.casefold()
+                clash = next((other for other in self.ordered()
+                              if other.slot != slot and other.alias is not None
+                              and other.alias.casefold() == folded), None)
+                if clash is not None:
+                    raise errors.UserError(
+                        f"Alias is already used by slot {clash.slot}; "
+                        "aliases must identify one account"
+                    )
             account.alias = alias
             self.save()
             return account
@@ -327,6 +346,7 @@ class AccountStore:
             if usage_b is not None:
                 cache[str(a)] = usage_b
             self._write_usage_cache(cache)
+            self._remap_directories({a: b, b: a})
             self.save()
 
     def move_slot(self, slot: int, new_slot: int) -> None:
@@ -353,6 +373,7 @@ class AccountStore:
             if usage is not None:
                 cache[str(new_slot)] = usage
             self._write_usage_cache(cache)
+            self._remap_directories({slot: new_slot})
             self.save()
 
     def enabled_accounts(self) -> List[Account]:
@@ -360,6 +381,32 @@ class AccountStore:
 
     def ordered(self) -> List[Account]:
         return [self.accounts[slot] for slot in sorted(self.accounts)]
+
+    def _remap_directories(self, moves: Dict[int, Optional[int]]) -> None:
+        """Move or drop directory mappings so they follow the account, not the slot.
+
+        A mapping is a promise that `codexswap run` in this directory uses *this
+        account*. Leaving it behind after a remove or a move silently hands the
+        directory to whichever account lands in that slot next.
+        """
+        if self._root is not None:
+            # Alternate roots are test and export scratch spaces with no mappings.
+            return
+        from . import mappings
+
+        current = mappings.load_mappings()
+        updated = {}
+        changed = False
+        for directory, slot in current.items():
+            if slot not in moves:
+                updated[directory] = slot
+                continue
+            changed = True
+            destination = moves[slot]
+            if destination is not None:
+                updated[directory] = destination
+        if changed:
+            mappings.save_mappings(updated)
 
     def _read_usage_cache(self) -> Dict[str, dict]:
         cache = paths.read_json_tolerant(self._path(paths.usage_cache_path()), {})

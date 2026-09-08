@@ -11,18 +11,23 @@ must enforce that choice; the supported default lives in appserver.py.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 import uuid
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, errors
-from .models import ResetCredit
+from . import __version__, errors, identity
+from .models import ResetCredit, UsageSnapshot
 
 BASE_URL = "https://chatgpt.com/backend-api"
+# Mirrors resets.OUTCOMES, which cannot be imported here: resets imports this.
+OUTCOMES = ("reset", "nothingToReset", "noCredit", "alreadyRedeemed")
 
 
 # Bounded so that redacting a hostile multi-megabyte body cannot stall the caller;
@@ -189,7 +194,9 @@ def consume_reset_credit(
         result = result.get("outcome", result.get("result"))
         if isinstance(result, dict):
             result = result.get("outcome")
-    if isinstance(result, str):
+    # Only the four documented outcomes may leave this call; an arbitrary string
+    # would be printed and logged verbatim, straight past the redactor.
+    if isinstance(result, str) and result in OUTCOMES:
         return result
     raise errors.BackendError("Unrecognised backend reset-credit outcome")
 
@@ -199,3 +206,30 @@ def read_usage(access_token: str, account_id: str, *, timeout: float = 20.0) -> 
     if not isinstance(result, dict):
         raise errors.BackendError("Unrecognised backend usage response")
     return result
+
+
+def probe_usage(codex_home: Path, *, timeout: float = 20.0) -> UsageSnapshot:
+    """The `--backend` fallback for `appserver.probe_usage`.
+
+    Callers must gate this behind the explicit opt-in; nothing here decides policy.
+    `/wham/usage` is undocumented and its shape is unverified, so an unrecognised
+    payload yields unknown usage rather than invented numbers, and reset credits come
+    from the endpoint whose shape section 1.5 does record.
+    """
+    auth = identity.load_auth(Path(codex_home) / "auth.json")
+    tokens = auth.get("tokens")
+    tokens = tokens if isinstance(tokens, dict) else {}
+    access_token = tokens.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise errors.BackendError(
+            "The undocumented backend needs an OAuth access token; this account has none"
+        )
+    account_id = identity.identity_from_auth(auth).account_id or ""
+    fetched_at = time.time()
+    snapshot = UsageSnapshot.from_api(
+        read_usage(access_token, account_id, timeout=timeout), fetched_at=fetched_at
+    )
+    if snapshot.reset_credits:
+        return snapshot
+    credits = list_reset_credits(access_token, account_id, timeout=timeout)
+    return dataclasses.replace(snapshot, reset_credits=tuple(credits))

@@ -129,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("path", nargs="?", type=Path)
     child = command("probe", "Refresh usage for one account or all enabled accounts")
     child.add_argument("ref", nargs="?")
+    child.add_argument("--backend", action="store_true",
+                       help="on failure, fall back to unsupported chatgpt.com endpoints")
     _json_flag(child)
     child = command("reset", "List or redeem rate-limit reset credits for the active account")
     _json_flag(child)
@@ -194,8 +196,26 @@ def _cached_all(store, settings, accounts) -> Dict[int, Tuple[Optional[UsageSnap
     return usages
 
 
-def _probe_all(store, settings, *, accounts, force=False, auth_failed=None
-               ) -> Dict[int, Tuple[Optional[UsageSnapshot], bool]]:
+def _backend_fallback(store, account, settings, results, auth_failed):
+    """Last resort for one account, reachable only through the explicit opt-in."""
+    from . import backend
+
+    try:
+        snapshot = backend.probe_usage(store._path(paths.slot_home(account.slot)),
+                                       timeout=settings.probe_timeout)
+    except errors.AuthExpired:
+        if auth_failed is not None:
+            auth_failed.add(account.slot)
+    except Exception:
+        # Never surface backend diagnostics here; they can quote a response body.
+        pass
+    else:
+        results[account.slot] = (snapshot, False)
+        store.record_usage(account.slot, snapshot)
+
+
+def _probe_all(store, settings, *, accounts, force=False, auth_failed=None,
+               allow_backend=False) -> Dict[int, Tuple[Optional[UsageSnapshot], bool]]:
     accounts = list(accounts)
     results: Dict[int, Tuple[Optional[UsageSnapshot], bool]] = {}
     pending = []
@@ -241,6 +261,8 @@ def _probe_all(store, settings, *, accounts, force=False, auth_failed=None
                     continue
                 except Exception:
                     # Do not surface subprocess diagnostics that could contain tokens.
+                    if allow_backend or settings.allow_backend_fallback:
+                        _backend_fallback(store, account, settings, results, auth_failed)
                     continue
     except Exception:
         # Missing binaries, executor failures, and unreadable caches degrade output.
@@ -296,7 +318,8 @@ def _show_accounts(args, store, settings, color):
     if not getattr(args, "no_probe", False):
         to_probe = accounts if single else [account for account in accounts if not account.disabled]
         usages.update(_probe_all(store, settings, accounts=to_probe,
-                                 force=args.command == "probe", auth_failed=auth_failed))
+                                 force=args.command == "probe", auth_failed=auth_failed,
+                                 allow_backend=getattr(args, "backend", False)))
     for account in accounts:
         # A missing or unreadable slot file must not prevent listing the stored account.
         with contextlib.suppress(errors.CodexSwapError, OSError):
@@ -745,7 +768,21 @@ def _import_summary(result) -> str:
     return ""
 
 
+def _tolerate_legacy_console() -> None:
+    """Never fail a command because the console cannot encode its own output.
+
+    Windows consoles still default to a legacy code page (CP949 on this developer's
+    machine), where printing an emoji alias raises UnicodeEncodeError *after* the
+    alias has already been set, so a successful mutation reports failure and exits 1.
+    Unencodable characters become backslash escapes; a UTF-8 terminal is unaffected.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    _tolerate_legacy_console()
     arguments: List[str] = list(sys.argv[1:] if argv is None else argv)
     before_separator = arguments[:arguments.index("--")] if "--" in arguments else arguments
     debug = "--debug" in before_separator

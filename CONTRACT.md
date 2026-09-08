@@ -174,6 +174,14 @@ the user passes `--backend`, or when the app-server path fails and
 `probe.allowBackendFallback` is true (default **false**). Every code path that uses
 them must be reachable only through those two switches.
 
+`backend.probe_usage(codex_home, *, timeout)` is the fallback that `cli._probe_all`
+calls after an app-server probe fails, and only under one of those two switches. It
+reads the slot's own `auth.json` for the access token and account id. `/wham/usage`
+is undocumented and its shape unverified, so an unrecognised payload yields **unknown
+usage** rather than invented numbers, and reset credits come from the endpoint whose
+shape this section does record. `backend.consume_reset_credit` accepts only the four
+documented outcomes, as `appserver` does.
+
 ---
 
 ## 2. Storage layout
@@ -355,6 +363,25 @@ original is gone. Three rules keep that from happening:
   keeps the newer one. A probe refreshes a slot's own credential, and refresh tokens
   rotate, so blindly copying an older live file over a newer slot file can void the
   account. When either stamp is missing or unreadable the live copy wins, as before.
+
+### 3.3 Registry consistency
+
+`AccountStore.load()` runs outside the lock, so an in-memory registry is a snapshot
+that another process can invalidate. `AccountStore.reload()` re-reads it inside the
+lock, refreshing existing `Account` objects in place so a caller holding one keeps a
+live view. Every mutating method calls it first, as do `switcher.activate`,
+`switcher.sync_live_to_slot` and `transfer.import_accounts`, which hold the lock
+themselves. Without it, two `codexswap add` runs both allocate slot 1 and the second
+save erases the first account and its credential.
+
+Two references must never silently select the wrong account:
+
+- `set_alias` refuses an alias another slot already uses (case-insensitively), and
+  `resolve` raises `UserError` listing the candidates if a registry written by an
+  older build still holds duplicates.
+- A directory mapping is a promise that `run` in that directory uses *that account*,
+  so `remove`, `move_slot` and `swap_slots` move or drop its mappings. Left behind,
+  the mapping would hand the directory to whichever account reuses the slot.
 
 ---
 
@@ -654,7 +681,7 @@ codexswap move <ref> <slot>
 codexswap run [<ref>] [-- <codex args>...]
 codexswap map [<ref> [path]]
 codexswap unmap [path]
-codexswap probe [<ref>] [--json]
+codexswap probe [<ref>] [--backend] [--json]
 codexswap reset [list] [--json]
 codexswap reset use [<ref>] [--credit ID] [--yes] [--dry-run]
 codexswap auto [--once] [--dry-run] [--interval N] [--threshold N]

@@ -105,7 +105,10 @@ a different active account.
 
 Square brackets indicate optional arguments. `<ref>` resolves by slot number,
 case-insensitive alias, case-insensitive email, then unique email prefix. An
-ambiguous reference reports the matching candidates.
+ambiguous reference reports the matching candidates rather than picking one:
+aliases must be unique, and `codexswap alias` refuses a name another slot already
+uses. A directory mapping follows its account through `move`, `swap` and `remove`,
+so it never silently transfers to whichever account lands in that slot next.
 
 | Command | Description |
 | --- | --- |
@@ -129,7 +132,7 @@ ambiguous reference reports the matching candidates.
 | `codexswap run [<ref>] [-- <codex args>...]` | Run Codex in a slot's home, using the current directory's mapping if no reference is given. |
 | `codexswap map [<ref> [path]]` | List directory mappings or map a directory to an account. |
 | `codexswap unmap [path]` | Remove a directory mapping, defaulting to the current directory. |
-| `codexswap probe [<ref>] [--json]` | Probe usage for the selected account. |
+| `codexswap probe [<ref>] [--backend] [--json]` | Probe usage for the selected account. |
 | `codexswap reset [list] [--json]` | List the active account's banked reset credits. |
 | `codexswap reset use [<ref>] [--credit ID] [--yes] [--dry-run]` | Redeem a reset credit with confirmation, or preview the redemption. |
 | `codexswap auto [--once] [--dry-run] [--interval N] [--threshold N]` | Run automatic monitoring, optionally for one tick or without switching or redeeming. |
@@ -473,6 +476,11 @@ The exception is the explicitly opt-in `--backend` fallback, or enabling
 Those paths make authenticated requests directly to OpenAI's undocumented
 `chatgpt.com/backend-api` endpoints. The fallback setting defaults to `false`;
 these endpoints are unsupported and may change.
+
+`codexswap probe --backend` uses that fallback for one run; the setting enables it
+whenever the supported path fails. It reads only what section 1.5 of `CONTRACT.md`
+records: an unrecognised usage payload leaves usage unknown rather than inventing
+numbers, and reset credits come from the endpoint whose shape is documented.
 
 Stored credential files contain **OAuth refresh tokens** and are written with
 mode **`0600` on POSIX**. Windows relies on your **user-profile ACLs**; codexswap

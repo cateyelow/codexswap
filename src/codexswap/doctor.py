@@ -101,7 +101,12 @@ def collect_checks() -> Dict[str, Any]:
 
     add("codexswap", "ok", __version__)
     add("python", "ok", platform.python_version())
-    add("platform", "ok", platform.platform())
+    # Not platform.platform(): on macOS it shells out to `file` to read the
+    # executable's architecture, so a diagnostic command would spawn a process just
+    # to print its own banner. These three are pure reads of uname.
+    add("platform", "ok", " ".join(
+        part for part in (platform.system(), platform.release(), platform.machine()) if part
+    ))
     root = paths.codexswap_home().resolve()
     live = paths.codex_home().resolve()
     for name, directory in (("CODEXSWAP_HOME", root), ("CODEX_HOME", live)):

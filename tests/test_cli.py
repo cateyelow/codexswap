@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from conftest import RATE_LIMITS_RESULT, make_auth
@@ -26,7 +28,7 @@ COMMAND_ARGV = [
     ["run"], ["run", "2"], ["run", "2", "--", "--resume"], ["run", "--", "--resume"],
     ["map"], ["map", "2"], ["map", "2", "project"],
     ["unmap"], ["unmap", "project"],
-    ["probe"], ["probe", "2", "--json"],
+    ["probe"], ["probe", "2", "--json"], ["probe", "--backend"],
     ["reset"], ["reset", "--json"], ["reset", "list"], ["reset", "list", "--json"],
     ["reset", "use"], ["reset", "use", "2", "--credit", "fixture-credit", "--yes", "--dry-run"],
     ["auto"], ["auto", "--once", "--dry-run", "--interval", "60", "--threshold", "80"],
@@ -265,3 +267,71 @@ def test_probe_failure_still_lists_account(monkeypatch, capsys, cached):
     assert calls == [paths.slot_home(account.slot)]
     assert "stale" in captured.out if cached else "unavailable" in captured.out
     assert captured.err == ""
+
+
+def _failing_probe(*args, **kwargs):
+    raise errors.AppServerError("fixture probe failure")
+
+
+@pytest.mark.parametrize("enable", ["flag", "setting", "neither"])
+def test_backend_fallback_is_reachable_only_through_its_two_switches(
+    seeded_store, monkeypatch, capsys, enable,
+):
+    from codexswap import backend
+
+    calls = []
+    fresh = replace(
+        UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW), account_id="acct-0000-1111",
+    )
+
+    def fallback(codex_home, *, timeout):
+        calls.append(Path(codex_home).name)
+        return fresh
+
+    monkeypatch.setattr(appserver, "probe_usage", _failing_probe)
+    monkeypatch.setattr(backend, "probe_usage", fallback)
+    argv = ["probe", "1"]
+    if enable == "flag":
+        argv.append("--backend")
+    elif enable == "setting":
+        assert cli.main(["config", "set", "probe.allowBackendFallback", "true"]) == 0
+        capsys.readouterr()
+
+    assert cli.main(argv) == 0
+    output = capsys.readouterr().out
+    if enable == "neither":
+        # The default must never reach an unsupported endpoint, not even on failure.
+        assert calls == []
+    else:
+        assert calls == ["1"]
+        assert "84" in output
+
+
+def test_backend_fallback_reports_a_rejected_credential(seeded_store, monkeypatch, capsys):
+    from codexswap import backend
+
+    def rejected(codex_home, *, timeout):
+        raise errors.AuthExpired("fixture rejection")
+
+    monkeypatch.setattr(appserver, "probe_usage", _failing_probe)
+    monkeypatch.setattr(backend, "probe_usage", rejected)
+    assert cli.main(["probe", "1", "--backend"]) == 0
+    assert "re-login" in capsys.readouterr().out
+
+
+def test_legacy_console_encoding_does_not_fail_a_successful_mutation(
+    seeded_store, monkeypatch, capsys,
+):
+    """A CP949 console must not turn an applied change into exit 1."""
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp949", newline="\n")
+    monkeypatch.setattr(cli.sys, "stdout", stream)
+    monkeypatch.setattr(cli.sys, "stderr", stream)
+
+    assert cli.main(["alias", "1", "\U0001f98a"]) == 0
+    stream.flush()
+    printed = buffer.getvalue().decode("cp949")
+    assert "set alias for slot 1" in printed
+    assert AccountStore.load().get(1).alias == "\U0001f98a"
+    # The name itself cannot survive CP949; an escape is the honest rendering.
+    assert r"\U0001f98a" in printed
