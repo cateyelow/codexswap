@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+import pytest
 from conftest import RATE_LIMITS_RESULT, make_auth
 
 from codexswap import identity, models
@@ -316,3 +317,39 @@ def test_percent_for_ignores_blank_names():
     snap = _with_limits(("codex_bengalfox", "GPT-5.3-Codex-Spark", 97.0, None))
 
     assert snap.percent_for(["", "   "]) == 10.0
+
+
+def _identity(account_id):
+    return models.AccountIdentity(
+        email="a@example.com", name="A", account_id=account_id, plan_type="pro",
+        auth_mode="chatgpt", subscription_active_until=None,
+        access_token_exp=None, id_token_exp=None,
+    )
+
+
+def _snapshot_for(account_id):
+    return models.UsageSnapshot(
+        fetched_at=NOW, account_id=account_id, plan_type="pro", primary=None, secondary=None,
+        has_credits=False, credits_balance=None, reset_credits=(), per_limit=(),
+    )
+
+
+@pytest.mark.parametrize("probed,registered,expected", [
+    ("acct-1", "acct-1", True),
+    ("acct-1", "acct-2", False),
+    ("acct-1", None, True),
+    (None, "acct-1", True),
+    (None, None, True),
+    ("acct-1", "", True),
+    ("", "acct-1", True),
+    ("  acct-1  ", "acct-1", True),
+    ("acct-1", "  acct-1  ", True),
+    ("ACCT-1", "acct-1", False),
+])
+def test_describes_only_rejects_two_known_and_different_ids(probed, registered, expected):
+    assert _snapshot_for(probed).describes(_identity(registered)) is expected
+
+
+def test_the_verified_payload_describes_the_account_it_came_from():
+    assert snapshot().describes(_identity("acct-0000-1111")) is True
+    assert snapshot().describes(_identity("acct-somebody-else")) is False

@@ -16,12 +16,12 @@ from .store import AccountStore
 def export_accounts(
     store: AccountStore, path: Union[str, Path], *, account_ref: Optional[str] = None,
 ) -> int:
-    with FileLock(store._path(paths.lock_path())):
+    with FileLock(store.path_for(paths.lock_path())):
         accounts = ([store.resolve(account_ref)] if account_ref is not None else store.ordered())
         entries = []
         for account in accounts:
             try:
-                auth = identity.load_auth(store._path(paths.slot_auth_path(account.slot)))
+                auth = identity.load_auth(store.path_for(paths.slot_auth_path(account.slot)))
             except errors.AuthFileMissing:
                 print(f"warning: skipping slot {account.slot} because its auth file is missing",
                       file=sys.stderr)
@@ -81,10 +81,10 @@ def import_accounts(
 
     remaps: List[Tuple[int, int]] = []
     destinations: Dict[int, int] = {}
-    with FileLock(store._path(paths.lock_path())):
+    with FileLock(store.path_for(paths.lock_path())):
         store.reload()
         had_active = store.active_slot is not None
-        cache = store._read_usage_cache()
+        cache = store.read_usage_cache()
         for entry, derived in validated:
             source = entry["slot"]
             destination = source
@@ -93,9 +93,9 @@ def import_accounts(
             # CONTRACT: imports preserve every entry, bypassing add's identity deduplication.
             account = Account(slot=destination, identity=derived, alias=entry.get("alias"),
                               disabled=entry.get("disabled", False), added_at=paths.iso_now())
-            paths.ensure_dir(store._path(paths.slot_home(destination)))
+            paths.ensure_dir(store.path_for(paths.slot_home(destination)))
             store.seed_config(destination)
-            paths.atomic_write_json(store._path(paths.slot_auth_path(destination)),
+            paths.atomic_write_json(store.path_for(paths.slot_auth_path(destination)),
                                     entry["auth"], mode=0o600)
             store.accounts[destination] = account
             cache.pop(str(destination), None)
@@ -103,6 +103,6 @@ def import_accounts(
             remaps.append((source, destination))
         if not had_active and active in destinations:
             store.active_slot = destinations[active]
-        store._write_usage_cache(cache)
+        store.write_usage_cache(cache)
         store.save()
     return remaps

@@ -552,6 +552,13 @@ import seeds a missing config from the destination machine's live Codex home.
 - **No usage appears for an API-key account:** API-key accounts are supported,
   but usage data is unavailable for them. Missing usage does not make the account
   registration invalid.
+- **`slot N answered for a different account than the registry records`:** that
+  slot's stored `auth.json` belongs to somebody else, usually because it was copied
+  in by hand or a `codex login` was run with `CODEX_HOME` pointed at the slot.
+  Usage for it is hidden and `codexswap reset use` refuses, because redeeming would
+  spend the credit of whoever is actually in that slot. Fix it by logging in to the
+  intended account and running `codexswap add`, which refreshes the existing slot,
+  or by removing the slot and adding it again.
 
 ## Contributing
 

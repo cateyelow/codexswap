@@ -341,13 +341,22 @@ class _AutoAccounts:
                 raise errors.AppServerError("usage probe failed")
             if account.slot not in self.readings:
                 try:
-                    self.readings[account.slot] = appserver.probe_usage(
-                        self.store._path(paths.slot_home(account.slot)),
+                    snapshot = appserver.probe_usage(
+                        self.store.path_for(paths.slot_home(account.slot)),
                         timeout=self.settings.probe_timeout,
                     )
                 except (errors.CodexSwapError, OSError):
                     self.failures.add(account.slot)
                     raise
+                if not snapshot.describes(account.identity):
+                    # The slot home holds someone else. The daemon can spend a reset
+                    # credit, so an account it cannot identify is unusable, not idle.
+                    self.failures.add(account.slot)
+                    raise errors.AppServerError(
+                        f"slot {account.slot} answered for a different account "
+                        "than the registry records"
+                    )
+                self.readings[account.slot] = snapshot
             return self.readings[account.slot]
         if account.slot != self.store.active_slot:
             for other in self.store.enabled_accounts():
@@ -426,7 +435,7 @@ def run(
                     redeemer=lambda account, credit_id, store=store, timeout=(
                         settings.probe_timeout
                     ): resets.redeem(
-                        store._path(paths.slot_home(account.slot)),
+                        store.path_for(paths.slot_home(account.slot)),
                         credit_id=credit_id, timeout=timeout,
                     ),
                     activator=lambda account, store=store: switcher.activate(

@@ -24,7 +24,13 @@ class AccountStore:
         self.active_slot = None
         self._root = Path(root).expanduser().resolve() if root is not None else None
 
-    def _path(self, default: Path) -> Path:
+    def path_for(self, default: Path) -> Path:
+        """Re-root a `paths` location under this store, honouring --home.
+
+        Public because switcher, transfer, auto, and cli all need the same
+        translation: every file a store owns lives under its root, and a store
+        constructed with an explicit root must not touch $CODEXSWAP_HOME.
+        """
         if self._root is None:
             return default
         return self._root / default.relative_to(paths.codexswap_home())
@@ -32,7 +38,7 @@ class AccountStore:
     @classmethod
     def load(cls, root: Optional[Path] = None) -> AccountStore:
         store = cls(root)
-        registry = store._path(paths.accounts_path())
+        registry = store.path_for(paths.accounts_path())
         try:
             data = paths.read_json(registry)
             if data is None and not registry.exists():
@@ -83,9 +89,9 @@ class AccountStore:
         self.active_slot = fresh.active_slot
 
     def save(self) -> None:
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             paths.atomic_write_json(
-                self._path(paths.accounts_path()),
+                self.path_for(paths.accounts_path()),
                 {"version": 1, "activeSlot": self.active_slot,
                  "accounts": [account.to_dict() for account in self.ordered()]},
                 mode=0o600,
@@ -152,7 +158,7 @@ class AccountStore:
         if slot is not None:
             self._validate_slot(slot)
         derived = identity.identity_from_auth(auth)
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             existing = (self.find_by_account_id(derived.account_id)
                         if derived.account_id is not None else None)
@@ -167,9 +173,9 @@ class AccountStore:
                 # CONTRACT: addedAt uses iso_now(); now does not alter its format.
                 account = Account(slot=slot, identity=derived, alias=alias,
                                   added_at=paths.iso_now())
-            paths.ensure_dir(self._path(paths.slot_home(account.slot)))
+            paths.ensure_dir(self.path_for(paths.slot_home(account.slot)))
             self.seed_config(account.slot)
-            paths.atomic_write_json(self._path(paths.slot_auth_path(account.slot)),
+            paths.atomic_write_json(self.path_for(paths.slot_auth_path(account.slot)),
                                     auth, mode=0o600)
             account.identity = derived
             self.accounts[account.slot] = account
@@ -204,7 +210,7 @@ class AccountStore:
         except (OSError, UnicodeError):
             raise errors.UserError("Cannot read source config.toml") from None
         results = []
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             accounts = [self.resolve(ref)] if ref is not None else self.ordered()
             for account in accounts:
@@ -231,7 +237,7 @@ class AccountStore:
         if not isinstance(token, str) or not token.strip():
             raise errors.UserError("API key must not be empty")
         token = token.strip()
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             # CONTRACT: key registration allocates a new slot; unlike OAuth capture
             # it has no embedded identity for deduplication and does not activate it.
@@ -254,14 +260,14 @@ class AccountStore:
             return account
 
     def _checked_home(self, slot: int) -> Path:
-        home = self._path(paths.slot_home(slot))
-        parent = self._path(paths.homes_dir()).resolve()
+        home = self.path_for(paths.slot_home(slot))
+        parent = self.path_for(paths.homes_dir()).resolve()
         if home.is_symlink() or home.resolve().parent != parent:
             raise errors.UserError("Slot home must be inside the homes directory")
         return home
 
     def remove(self, slot: int) -> Account:
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             account = self.get(slot)
             home = self._checked_home(slot)
@@ -269,16 +275,16 @@ class AccountStore:
             del self.accounts[slot]
             if self.active_slot == slot:
                 self.active_slot = None
-            cache = self._read_usage_cache()
+            cache = self.read_usage_cache()
             cache.pop(str(slot), None)
-            self._write_usage_cache(cache)
+            self.write_usage_cache(cache)
             # A mapping left behind would point at whichever account reuses this slot.
             self._remap_directories({slot: None})
             self.save()
             return account
 
     def set_alias(self, slot: int, alias: Optional[str]) -> Account:
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             account = self.get(slot)
             if alias is not None:
@@ -296,7 +302,7 @@ class AccountStore:
             return account
 
     def set_disabled(self, slot: int, disabled: bool) -> Account:
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             account = self.get(slot)
             account.disabled = disabled
@@ -304,7 +310,7 @@ class AccountStore:
             return account
 
     def swap_slots(self, a: int, b: int) -> None:
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             first, second = self.get(a), self.get(b)
             if a == b:
@@ -339,19 +345,19 @@ class AccountStore:
             elif self.active_slot == b:
                 self.active_slot = a
             # CONTRACT: cached usage follows the account when its slot changes.
-            cache = self._read_usage_cache()
+            cache = self.read_usage_cache()
             usage_a, usage_b = cache.pop(str(a), None), cache.pop(str(b), None)
             if usage_a is not None:
                 cache[str(b)] = usage_a
             if usage_b is not None:
                 cache[str(a)] = usage_b
-            self._write_usage_cache(cache)
+            self.write_usage_cache(cache)
             self._remap_directories({a: b, b: a})
             self.save()
 
     def move_slot(self, slot: int, new_slot: int) -> None:
         self._validate_slot(new_slot)
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             account = self.get(slot)
             if new_slot in self.accounts:
@@ -367,12 +373,12 @@ class AccountStore:
             self.accounts[new_slot] = account
             if self.active_slot == slot:
                 self.active_slot = new_slot
-            cache = self._read_usage_cache()
+            cache = self.read_usage_cache()
             usage = cache.pop(str(slot), None)
             cache.pop(str(new_slot), None)
             if usage is not None:
                 cache[str(new_slot)] = usage
-            self._write_usage_cache(cache)
+            self.write_usage_cache(cache)
             self._remap_directories({slot: new_slot})
             self.save()
 
@@ -408,20 +414,21 @@ class AccountStore:
         if changed:
             mappings.save_mappings(updated)
 
-    def _read_usage_cache(self) -> Dict[str, dict]:
-        cache = paths.read_json_tolerant(self._path(paths.usage_cache_path()), {})
+    def read_usage_cache(self) -> Dict[str, dict]:
+        """The whole usage cache, keyed by slot as a string. Callers hold the lock."""
+        cache = paths.read_json_tolerant(self.path_for(paths.usage_cache_path()), {})
         return cache if isinstance(cache, dict) else {}
 
-    def _write_usage_cache(self, cache: Dict[str, dict]) -> None:
-        paths.atomic_write_json(self._path(paths.usage_cache_path()), cache, mode=0o600)
+    def write_usage_cache(self, cache: Dict[str, dict]) -> None:
+        paths.atomic_write_json(self.path_for(paths.usage_cache_path()), cache, mode=0o600)
 
     def record_usage(self, slot: int, snapshot: UsageSnapshot) -> None:
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             account = self.get(slot)
-            cache = self._read_usage_cache()
+            cache = self.read_usage_cache()
             cache[str(slot)] = snapshot.to_dict()
-            self._write_usage_cache(cache)
+            self.write_usage_cache(cache)
             account.last_seen_usage = snapshot
             account.last_seen_at = snapshot.fetched_at
             self.save()
@@ -432,12 +439,12 @@ class AccountStore:
         A redeemed reset credit changes both windows and the credit list at once,
         which makes every cached number wrong immediately rather than merely stale.
         """
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             account = self.accounts.get(slot)
-            cache = self._read_usage_cache()
+            cache = self.read_usage_cache()
             if cache.pop(str(slot), None) is not None:
-                self._write_usage_cache(cache)
+                self.write_usage_cache(cache)
             if account is not None:
                 account.last_seen_usage = None
                 account.last_seen_at = None
@@ -448,7 +455,7 @@ class AccountStore:
         now: Optional[float] = None,
     ) -> Optional[UsageSnapshot]:
         self.get(slot)
-        data = self._read_usage_cache().get(str(slot))
+        data = self.read_usage_cache().get(str(slot))
         if not isinstance(data, dict):
             return None
         try:
@@ -461,7 +468,7 @@ class AccountStore:
         return snapshot
 
     def set_active(self, slot: Optional[int]) -> None:
-        with FileLock(self._path(paths.lock_path())):
+        with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             if slot is not None:
                 self.get(slot)

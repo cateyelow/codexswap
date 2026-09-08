@@ -178,14 +178,17 @@ def build_parser() -> argparse.ArgumentParser:
 def _cached(store, account, *, max_age, now) -> Optional[UsageSnapshot]:
     if account.identity.auth_mode == "apikey":
         return None
+    # A cache entry written before this check existed, or edited by hand, can name
+    # another account. Showing it would attribute one person's usage to another.
     try:
         snapshot = store.cached_usage(account.slot, max_age=max_age, now=now)
-        if snapshot is not None:
+        if snapshot is not None and snapshot.describes(account.identity):
             return snapshot
     except Exception:
         pass
     snapshot = account.last_seen_usage
-    if snapshot is not None and now - snapshot.fetched_at <= max_age:
+    if (snapshot is not None and now - snapshot.fetched_at <= max_age
+            and snapshot.describes(account.identity)):
         return snapshot
     return None
 
@@ -205,7 +208,7 @@ def _backend_fallback(store, account, settings, results, auth_failed):
     from . import backend
 
     try:
-        snapshot = backend.probe_usage(store._path(paths.slot_home(account.slot)),
+        snapshot = backend.probe_usage(store.path_for(paths.slot_home(account.slot)),
                                        timeout=settings.probe_timeout)
     except errors.AuthExpired:
         if auth_failed is not None:
@@ -214,14 +217,19 @@ def _backend_fallback(store, account, settings, results, auth_failed):
         # Never surface backend diagnostics here; they can quote a response body.
         pass
     else:
+        if not snapshot.describes(account.identity):
+            return
         results[account.slot] = (snapshot, False)
         store.record_usage(account.slot, snapshot)
 
 
 def _probe_all(store, settings, *, accounts, force=False, auth_failed=None,
-               allow_backend=False) -> Dict[int, Tuple[Optional[UsageSnapshot], bool]]:
+               allow_backend=False, mismatched=None
+               ) -> Dict[int, Tuple[Optional[UsageSnapshot], bool]]:
     accounts = list(accounts)
     results: Dict[int, Tuple[Optional[UsageSnapshot], bool]] = {}
+    if mismatched is None:
+        mismatched = set()
     pending = []
     now = time.time()
     for account in accounts:
@@ -253,6 +261,12 @@ def _probe_all(store, settings, *, accounts, force=False, auth_failed=None,
                 try:
                     snapshot = future.result()
                     if snapshot is None:
+                        continue
+                    if not snapshot.describes(account.identity):
+                        # The slot home holds a different account than the registry
+                        # says. Caching this would attribute usage to the wrong
+                        # person; keep whatever was there and let doctor explain.
+                        mismatched.add(account.slot)
                         continue
                     results[account.slot] = (snapshot, False)
                     # Serialize registry/cache writes on the calling thread.
@@ -319,11 +333,18 @@ def _show_accounts(args, store, settings, color):
         accounts = store.enabled_accounts() if args.command == "probe" else store.ordered()
     usages = _cached_all(store, settings, accounts)
     auth_failed = set()
+    mismatched = set()
     if not getattr(args, "no_probe", False):
         to_probe = accounts if single else [account for account in accounts if not account.disabled]
         usages.update(_probe_all(store, settings, accounts=to_probe,
                                  force=args.command == "probe", auth_failed=auth_failed,
-                                 allow_backend=getattr(args, "backend", False)))
+                                 allow_backend=getattr(args, "backend", False),
+                                 mismatched=mismatched))
+    if mismatched:
+        # Reading is harmless, so say it and carry on; --json keeps stdout clean.
+        print("warning: slot {} answered for a different account than the registry records; "
+              "run: codexswap doctor".format(", ".join(str(slot) for slot in sorted(mismatched))),
+              file=sys.stderr)
     for account in accounts:
         # A missing or unreadable slot file must not prevent listing the stored account.
         with contextlib.suppress(errors.CodexSwapError, OSError):
@@ -402,7 +423,16 @@ def _reset(args, store, settings, color):
     ref = getattr(args, "ref", None)
     account = store.resolve(ref) if ref is not None else _active_account(store)
     use = args.reset_command == "use"
-    snapshot, stale = _probe_all(store, settings, accounts=[account], force=use)[account.slot]
+    mismatched = set()
+    snapshot, stale = _probe_all(store, settings, accounts=[account], force=use,
+                                 mismatched=mismatched)[account.slot]
+    if account.slot in mismatched:
+        # Redemption is irreversible and spends the credit of whoever is actually in
+        # that slot home, not the account the user named. Refuse rather than guess.
+        raise errors.UserError(
+            f"slot {account.slot} answered for a different account than the registry records; "
+            "re-add it or run: codexswap doctor"
+        )
     if snapshot is None:
         raise errors.UserError(f"usage unavailable for slot {account.slot}; cannot read reset credits")
     now = time.time()

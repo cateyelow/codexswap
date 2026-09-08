@@ -464,7 +464,7 @@ def test_lock_file_left_by_dead_process_does_not_block(swap_home):
 def test_concurrent_record_usage_preserves_both_slots(two_accounts, monkeypatch):
     first_read = threading.Event()
     second_finished = threading.Event()
-    original_read = two_accounts._read_usage_cache
+    original_read = two_accounts.read_usage_cache
     counter_guard = threading.Lock()
     read_count = 0
 
@@ -481,7 +481,7 @@ def test_concurrent_record_usage_preserves_both_slots(two_accounts, monkeypatch)
             second_finished.wait(0.2)
         return cache
 
-    monkeypatch.setattr(two_accounts, "_read_usage_cache", delayed_read)
+    monkeypatch.setattr(two_accounts, "read_usage_cache", delayed_read)
     usages = {1: snapshot(12), 2: snapshot(34, account_id="second")}
 
     def record_second():

@@ -237,7 +237,7 @@ def capture_current(
         auth = identity.load_auth(paths.live_auth_path())
     except errors.AuthFileMissing:
         raise errors.AuthFileMissing("No live authentication file; run codex login first") from None
-    with FileLock(store._path(paths.lock_path())):
+    with FileLock(store.path_for(paths.lock_path())):
         account = store.add_from_auth(auth, slot=slot, alias=alias)
         # Capture reads the LIVE credential, so the captured account is by definition
         # the one Codex is using. Leaving activeSlot pointing at the previous account
@@ -250,7 +250,7 @@ def capture_current(
 def sync_live_to_slot(store: AccountStore) -> Optional[int]:
     if not paths.live_auth_path().exists():
         return None
-    with FileLock(store._path(paths.lock_path())):
+    with FileLock(store.path_for(paths.lock_path())):
         # Adopt anything another process registered while we were deciding.
         store.reload()
         try:
@@ -264,7 +264,7 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
             account = store.find_by_email(derived.email)
         if account is None:
             return None
-        slot_auth = store._path(paths.slot_auth_path(account.slot))
+        slot_auth = store.path_for(paths.slot_auth_path(account.slot))
         stored: Optional[dict] = None
         if slot_auth.is_file():
             with suppress(errors.AuthFileMissing, errors.AuthFileInvalid):
@@ -275,7 +275,7 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
             # tokens rotate, so the older live copy may already be void: keep the
             # newer one rather than writing the account backwards.
             return account.slot
-        paths.ensure_dir(store._path(paths.slot_home(account.slot)))
+        paths.ensure_dir(store.path_for(paths.slot_home(account.slot)))
         paths.atomic_write_json(slot_auth, auth, mode=0o600)
         account.identity = derived
         store.save()
@@ -294,10 +294,10 @@ def activate(
             )
         if processes:
             raise errors.CodexRunning(f"{describe_running(processes)}. Close them or pass --force")
-    with FileLock(store._path(paths.lock_path())):
+    with FileLock(store.path_for(paths.lock_path())):
         store.reload()
         target = store.get(target.slot)
-        auth_path = store._path(paths.slot_auth_path(target.slot))
+        auth_path = store.path_for(paths.slot_auth_path(target.slot))
         if not auth_path.is_file():
             raise errors.AuthFileMissing(
                 f"No auth file for slot {target.slot}; run codexswap add"
@@ -332,7 +332,7 @@ def run_as(store: AccountStore, account: Account, argv: Sequence[str]) -> int:
     account = store.get(account.slot)
     binary = find_codex_binary()
     env = slot_env(account.slot)
-    env["CODEX_HOME"] = str(store._path(paths.slot_home(account.slot)))
+    env["CODEX_HOME"] = str(store.path_for(paths.slot_home(account.slot)))
     return subprocess.call([binary] + list(argv), env=env)
 
 

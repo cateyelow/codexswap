@@ -383,6 +383,29 @@ Two references must never silently select the wrong account:
   so `remove`, `move_slot` and `swap_slots` move or drop its mappings. Left behind,
   the mapping would hand the directory to whichever account reuses the slot.
 
+### 3.4 The slot home must hold the account the registry names
+
+A probe reads whatever credential is in the slot home, so the registry entry is a
+label that can be wrong: a hand-copied `auth.json`, a restored backup, or a login
+performed directly into a slot home all leave the label pointing at someone else.
+
+`UsageSnapshot.describes(identity)` compares the probed `accountId` with the
+identity derived from the slot's `auth.json`. It is false only when both are known
+and differ, so API-key accounts and older caches that predate the field still match.
+
+Every place a reading is bound to a slot enforces it:
+
+- `cli._probe_all` and `cli._backend_fallback` discard a mismatched reading instead
+  of caching it, and record the slot in `mismatched`.
+- `cli._cached` refuses a mismatched cache entry, so a file written by an older
+  build cannot show one account's usage under another's name.
+- `list`, `status` and `probe` print one warning to stderr naming the slots and
+  continue; reading is harmless and `--json` keeps stdout parseable.
+- `reset list` and `reset use` raise `UserError`. Redemption is irreversible and
+  would spend the credit of whoever is actually in that slot home.
+- `auto._AutoAccounts.probe` raises `AppServerError`, so the daemon counts the slot
+  as an unhealthy probe rather than deciding anything about it.
+
 ---
 
 ## 4. Errors (`src/codexswap/errors.py`)

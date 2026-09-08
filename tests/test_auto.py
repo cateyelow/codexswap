@@ -390,3 +390,67 @@ def test_model_selection_does_not_change_the_reset_decision(scenario):
 
     assert scenario.redeemed == []
     assert result.action == "switched"
+
+
+def _auto_accounts(scenario, snapshot_for, monkeypatch):
+    """Wire the daemon's real probe adapter to a fake app-server."""
+    from codexswap import appserver
+
+    probed = []
+
+    def probe_usage(home, **kwargs):
+        probed.append(str(home))
+        return snapshot_for(str(home))
+
+    monkeypatch.setattr(appserver, "probe_usage", probe_usage)
+    return auto._AutoAccounts(scenario.store, scenario.settings, NOW), probed
+
+
+def test_daemon_probe_rejects_a_slot_that_answers_for_another_account(scenario, monkeypatch):
+    accounts, probed = _auto_accounts(
+        scenario, lambda home: replace(usage(10), account_id="acct-somebody-else"), monkeypatch,
+    )
+
+    with pytest.raises(errors.AppServerError) as caught:
+        accounts.probe(scenario.store.get(1))
+
+    assert "different account" in str(caught.value)
+    assert probed  # it really did probe; the reading is what was refused
+    # A refusal is remembered, so the same tick does not ask again.
+    with pytest.raises(errors.AppServerError):
+        accounts.probe(scenario.store.get(1))
+    assert len(probed) == 1
+
+
+def test_daemon_probe_accepts_the_matching_account(scenario, monkeypatch):
+    accounts, probed = _auto_accounts(
+        scenario, lambda home: replace(usage(10), account_id="acct-1"), monkeypatch,
+    )
+
+    assert accounts.probe(scenario.store.get(1)).percent_for() == 10
+    assert len(probed) == 1
+
+
+def test_daemon_probe_accepts_a_snapshot_with_no_account_id(scenario, monkeypatch):
+    accounts, _ = _auto_accounts(
+        scenario, lambda home: replace(usage(10), account_id=None), monkeypatch,
+    )
+
+    assert accounts.probe(scenario.store.get(1)).percent_for() == 10
+
+
+def test_a_mismatched_active_account_never_redeems(scenario, monkeypatch):
+    scenario.settings.set("reset.policy", "always")
+    scenario.settings.set("reset.minUsagePercent", "0")
+    accounts, _ = _auto_accounts(
+        scenario, lambda home: replace(usage(95), account_id="acct-somebody-else"), monkeypatch,
+    )
+
+    result = auto.tick(accounts, scenario.settings, scenario.state, now=NOW,
+                       probe=accounts.probe, redeemer=scenario.redeem,
+                       activator=scenario.activate)
+
+    assert scenario.redeemed == []
+    # The first refusal is a probe failure, so the credit decision is never reached.
+    assert result.action == "probe-failed"
+    assert scenario.state.unhealthy[1] == 1

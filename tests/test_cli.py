@@ -339,12 +339,12 @@ def test_legacy_console_encoding_does_not_fail_a_successful_mutation(
     assert r"\U0001f98a" in printed
 
 
-def _model_snapshot(percent, model_percent):
+def _model_snapshot(percent, model_percent, *, account_id):
     """A cached snapshot whose totals and named-model usage disagree."""
     from codexswap.models import PerLimitUsage, RateLimitWindow
 
     return replace(
-        UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW),
+        UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW), account_id=account_id,
         primary=RateLimitWindow(percent, 10080, int(NOW + 86400)), secondary=None,
         per_limit=(PerLimitUsage(
             limit_id="codex_bengalfox", limit_name="GPT-5.3-Codex-Spark",
@@ -363,9 +363,9 @@ def model_store():
                                       id_exp=int(NOW + 3600), access_exp=int(NOW + 86400)),
                             now=NOW)
     store.set_active(1)
-    store.record_usage(1, _model_snapshot(90, 90))
-    store.record_usage(2, _model_snapshot(5, 99))
-    store.record_usage(3, _model_snapshot(20, 1))
+    store.record_usage(1, _model_snapshot(90, 90, account_id="acct-1"))
+    store.record_usage(2, _model_snapshot(5, 99, account_id="acct-2"))
+    store.record_usage(3, _model_snapshot(20, 1, account_id="acct-3"))
     return store
 
 
@@ -412,3 +412,76 @@ def test_switch_model_still_honours_an_explicit_ref(model_store, live_auth):
     assert cli.main(["switch", "2", "--model", "codex_bengalfox"]) == 0
 
     assert AccountStore.load().active_slot == 2
+
+
+def _foreign_probe(monkeypatch, account_id="acct-somebody-else"):
+    """Make every probe answer for an account the registry does not know."""
+    homes = []
+
+    def probe(home, **kwargs):
+        homes.append(Path(home).name)
+        return replace(UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW),
+                       account_id=account_id)
+
+    monkeypatch.setattr(appserver, "probe_usage", probe)
+    return homes
+
+
+def test_reset_use_refuses_when_the_slot_answers_for_another_account(
+        seeded_store, monkeypatch, capsys):
+    _foreign_probe(monkeypatch)
+    # offline_cli makes any call to resets.redeem fail the test outright.
+    assert cli.main(["reset", "use", "--yes"]) == errors.UserError.exit_code
+    captured = capsys.readouterr()
+    assert "different account" in captured.err
+    assert captured.out == ""
+
+
+def test_reset_dry_run_refuses_the_same_way(seeded_store, monkeypatch, capsys):
+    _foreign_probe(monkeypatch)
+
+    assert cli.main(["reset", "use", "--dry-run"]) == errors.UserError.exit_code
+    assert "different account" in capsys.readouterr().err
+
+
+def test_reset_list_refuses_rather_than_showing_another_accounts_credits(
+        seeded_store, monkeypatch, capsys):
+    # reset list reuses a fresh cache, so drop it to make the command actually probe.
+    seeded_store.forget_usage(1)
+    _foreign_probe(monkeypatch)
+
+    assert cli.main(["reset", "list"]) == errors.UserError.exit_code
+    assert "different account" in capsys.readouterr().err
+
+
+def test_list_warns_on_stderr_and_keeps_json_parseable(seeded_store, monkeypatch, capsys):
+    seeded_store.forget_usage(1)
+    _foreign_probe(monkeypatch)
+
+    assert cli.main(["list", "--json"]) == 0
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document["accounts"][0]["usage"] is None
+    assert "different account" in captured.err
+
+
+def test_a_matching_probe_produces_no_warning(seeded_store, monkeypatch, capsys):
+    seeded_store.forget_usage(1)
+    _foreign_probe(monkeypatch, account_id="acct-0000-1111")
+
+    assert cli.main(["probe", "1", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["account"]["usage"] is not None
+    assert captured.err == ""
+
+
+def test_a_cached_snapshot_from_another_account_is_not_shown(seeded_store, capsys):
+    seeded_store.record_usage(1, replace(
+        UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW),
+        account_id="acct-somebody-else",
+    ))
+
+    assert cli.main(["list", "--no-probe", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["accounts"][0]["usage"] is None
+    assert captured.err == ""

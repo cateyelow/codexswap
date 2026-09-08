@@ -268,6 +268,18 @@ class UsageSnapshot:
         known = [value for value in percentages if value is not None]
         return max(known) if known else None
 
+    def describes(self, identity: AccountIdentity) -> bool:
+        """Whether this reading came from the account the registry names.
+
+        A slot home holds one account's credentials and the probe reads whatever is
+        in it, so a mismatch means the registry label is wrong: the usage shown, and
+        any credit redeemed, belong to somebody else. Unknown on either side matches,
+        because API-key accounts report no id and an older cache may predate it.
+        """
+        mine = (self.account_id or "").strip()
+        theirs = (identity.account_id or "").strip()
+        return not mine or not theirs or mine == theirs
+
     @property
     def available_reset_credits(self) -> Tuple[ResetCredit, ...]:
         return tuple(credit for credit in self.reset_credits if credit.is_available)
