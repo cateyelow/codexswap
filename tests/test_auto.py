@@ -53,10 +53,10 @@ class Scenario:
     def activate(self, account):
         self.activated.append(account.slot)
 
-    def tick(self, *, now, dry_run=False):
+    def tick(self, *, now, dry_run=False, journal=None):
         return auto.tick(self.store, self.settings, self.state, now=now,
                          probe=self.probe, redeemer=self.redeem, activator=self.activate,
-                         dry_run=dry_run)
+                         dry_run=dry_run, journal=journal)
 
 
 @pytest.fixture
@@ -174,15 +174,43 @@ def test_dry_run_decides_without_mutating_action_history(scenario, action, polic
     assert scenario.probed == [1, 2]
 
 
-def test_no_credit_outcome_records_nothing_and_falls_through_to_switch(scenario):
+def test_no_credit_outcome_costs_no_allowance_and_falls_through_to_switch(scenario):
     scenario.settings.set("reset.policy", "always")
     scenario.outcome = "noCredit"
     result = scenario.tick(now=NOW)
     assert result.action == "switched"
     assert scenario.redeemed == [(1, "RateLimitResetCredit_soonest")]
-    assert scenario.state.redemptions == []
+    # The attempt is written down, because a crash before the answer must still be
+    # visible. noCredit is the one outcome that proves nothing was spent, so it is
+    # the one outcome that does not consume the daily allowance.
+    assert [entry["outcome"] for entry in scenario.state.redemptions] == ["noCredit"]
+    assert scenario.state.redeemed_last_24h(NOW) == 0
     assert scenario.activated == [2]
     assert scenario.state.last_switch_at == NOW
+
+
+@pytest.mark.parametrize("outcome,counts", [
+    ("reset", 1), ("alreadyRedeemed", 1), ("nothingToReset", 1), ("noCredit", 0),
+])
+def test_attempt_outcomes_that_cannot_prove_the_credit_survived_use_the_cap(
+    scenario, outcome, counts,
+):
+    scenario.settings.set("reset.policy", "always")
+    scenario.outcome = outcome
+    scenario.tick(now=NOW)
+    assert scenario.state.redeemed_last_24h(NOW) == counts
+
+
+def test_crashed_attempt_left_pending_still_uses_the_cap(scenario):
+    # A process that dies between the consume request and its answer leaves this.
+    scenario.state.redemptions.append({
+        "at": NOW - 60, "slot": 1, "creditId": "credit-x", "outcome": "pending",
+    })
+    assert scenario.state.redeemed_last_24h(NOW) == 1
+    scenario.settings.set("reset.policy", "always")
+    result = scenario.tick(now=NOW)
+    assert result.action == "switched"
+    assert scenario.redeemed == []
 
 
 def test_no_active_slot_bootstraps_to_best_target(scenario):
@@ -250,3 +278,43 @@ def test_format_tick_is_a_stable_single_line():
     assert rendered == f"[{timestamp}] switched: 1 -> 2, 20%"
     assert rendered.splitlines() == [rendered]
     assert auto.format_tick(result, now=NOW) == rendered
+
+
+def test_shared_daily_cap_survives_a_second_process(scenario, swap_home):
+    """Two daemons on one home must not each spend a credit against a cap of one."""
+    scenario.settings.set("reset.policy", "always")
+    scenario.settings.set("reset.maxPerDay", "1")
+
+    # The other process redeemed a moment ago and wrote state.json. This process has
+    # been running since before that, so its in-memory history is still empty.
+    other = auto.AutoState(redemptions=[{
+        "at": NOW - 30, "slot": 2, "creditId": "credit-other",
+        "attempt": "other-process-attempt", "outcome": "reset",
+    }])
+    other.save()
+    assert scenario.state.redemptions == []
+
+    result = scenario.tick(
+        now=NOW, journal=auto.RedemptionJournal(scenario.state),
+    )
+    assert scenario.redeemed == [], "Spent a credit the shared cap had already used"
+    assert result.action == "switched"
+    # The other process's entry is adopted rather than overwritten.
+    assert [entry["creditId"] for entry in scenario.state.redemptions] == ["credit-other"]
+    assert auto.AutoState.load().redemptions[0]["attempt"] == "other-process-attempt"
+
+
+def test_journal_records_the_attempt_before_the_request_leaves(scenario, swap_home):
+    scenario.settings.set("reset.policy", "always")
+    recorded = []
+
+    def crash(account, credit_id):
+        # Exactly what a process killed mid-consume leaves behind on disk.
+        recorded.append(auto.AutoState.load().redemptions)
+        raise errors.AppServerTimeout("killed mid-consume")
+
+    scenario.redeem = crash
+    with pytest.raises(errors.AppServerTimeout):
+        scenario.tick(now=NOW, journal=auto.RedemptionJournal(scenario.state))
+    assert [entry["outcome"] for entry in recorded[0]] == ["pending"]
+    assert auto.AutoState.load().redeemed_last_24h(NOW) == 1

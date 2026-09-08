@@ -62,6 +62,26 @@ class AccountStore:
             store.active_slot = None
         return store
 
+    def reload(self) -> None:
+        """Re-read the registry so a locked mutation cannot save a stale snapshot.
+
+        `load()` happens outside the lock, so two processes can both hold an empty
+        registry, both allocate slot 1, and the second save then erases the first
+        account. Every mutation re-reads here, inside the lock, before it decides.
+        Callers that hold the lock themselves, such as `switcher.activate`, call this
+        first for the same reason.
+        """
+        fresh = AccountStore.load(self._root)
+        for slot, loaded in fresh.accounts.items():
+            current = self.accounts.get(slot)
+            if current is not None:
+                # Refresh in place: a caller holding this Account keeps a live view,
+                # and code that mutates it before save() still writes what it meant to.
+                current.__dict__.update(loaded.__dict__)
+                fresh.accounts[slot] = current
+        self.accounts = fresh.accounts
+        self.active_slot = fresh.active_slot
+
     def save(self) -> None:
         with FileLock(self._path(paths.lock_path())):
             paths.atomic_write_json(
@@ -126,6 +146,7 @@ class AccountStore:
             self._validate_slot(slot)
         derived = identity.identity_from_auth(auth)
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             existing = (self.find_by_account_id(derived.account_id)
                         if derived.account_id is not None else None)
             if existing is None and derived.email is not None:
@@ -177,6 +198,7 @@ class AccountStore:
             raise errors.UserError("Cannot read source config.toml") from None
         results = []
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             accounts = [self.resolve(ref)] if ref is not None else self.ordered()
             for account in accounts:
                 destination = self._checked_home(account.slot) / "config.toml"
@@ -203,6 +225,7 @@ class AccountStore:
             raise errors.UserError("API key must not be empty")
         token = token.strip()
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             # CONTRACT: key registration allocates a new slot; unlike OAuth capture
             # it has no embedded identity for deduplication and does not activate it.
             slot = self.next_free_slot() if slot is None else slot
@@ -232,6 +255,7 @@ class AccountStore:
 
     def remove(self, slot: int) -> Account:
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             account = self.get(slot)
             home = self._checked_home(slot)
             shutil.rmtree(home, ignore_errors=True)
@@ -246,6 +270,7 @@ class AccountStore:
 
     def set_alias(self, slot: int, alias: Optional[str]) -> Account:
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             account = self.get(slot)
             account.alias = alias
             self.save()
@@ -253,6 +278,7 @@ class AccountStore:
 
     def set_disabled(self, slot: int, disabled: bool) -> Account:
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             account = self.get(slot)
             account.disabled = disabled
             self.save()
@@ -260,6 +286,7 @@ class AccountStore:
 
     def swap_slots(self, a: int, b: int) -> None:
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             first, second = self.get(a), self.get(b)
             if a == b:
                 self.save()
@@ -305,6 +332,7 @@ class AccountStore:
     def move_slot(self, slot: int, new_slot: int) -> None:
         self._validate_slot(new_slot)
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             account = self.get(slot)
             if new_slot in self.accounts:
                 self.swap_slots(slot, new_slot)
@@ -342,6 +370,7 @@ class AccountStore:
 
     def record_usage(self, slot: int, snapshot: UsageSnapshot) -> None:
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             account = self.get(slot)
             cache = self._read_usage_cache()
             cache[str(slot)] = snapshot.to_dict()
@@ -357,6 +386,7 @@ class AccountStore:
         which makes every cached number wrong immediately rather than merely stale.
         """
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             account = self.accounts.get(slot)
             cache = self._read_usage_cache()
             if cache.pop(str(slot), None) is not None:
@@ -385,6 +415,7 @@ class AccountStore:
 
     def set_active(self, slot: Optional[int]) -> None:
         with FileLock(self._path(paths.lock_path())):
+            self.reload()
             if slot is not None:
                 self.get(slot)
             self.active_slot = slot

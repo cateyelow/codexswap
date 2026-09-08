@@ -239,8 +239,11 @@ def capture_current(
         raise errors.AuthFileMissing("No live authentication file; run codex login first") from None
     with FileLock(store._path(paths.lock_path())):
         account = store.add_from_auth(auth, slot=slot, alias=alias)
-        if store.active_slot is None:
-            store.set_active(account.slot)
+        # Capture reads the LIVE credential, so the captured account is by definition
+        # the one Codex is using. Leaving activeSlot pointing at the previous account
+        # made the documented quick start (login A, add, login B, add) end with auto
+        # and reset targeting A while B was live.
+        store.set_active(account.slot)
         return account
 
 
@@ -248,6 +251,8 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
     if not paths.live_auth_path().exists():
         return None
     with FileLock(store._path(paths.lock_path())):
+        # Adopt anything another process registered while we were deciding.
+        store.reload()
         try:
             auth = identity.load_auth(paths.live_auth_path())
         except errors.AuthFileMissing:
@@ -290,6 +295,7 @@ def activate(
         if processes:
             raise errors.CodexRunning(f"{describe_running(processes)}. Close them or pass --force")
     with FileLock(store._path(paths.lock_path())):
+        store.reload()
         target = store.get(target.slot)
         auth_path = store._path(paths.slot_auth_path(target.slot))
         if not auth_path.is_file():

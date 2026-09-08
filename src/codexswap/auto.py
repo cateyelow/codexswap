@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from . import errors, paths, resets, strategy
+from .locking import FileLock
 from .models import Account, UsageSnapshot
 from .settings import Settings
 from .store import AccountStore
@@ -19,6 +21,9 @@ from .store import AccountStore
 _logger = logging.getLogger(__name__)
 _DAY = 86400
 _MAX_LOG_BYTES = 2 * 1024 * 1024
+# Outcomes that prove the credit was NOT spent. Every other value, including a
+# crashed attempt left as "pending", counts against the cap: there is no proof.
+_UNSPENT_OUTCOMES = ("noCredit",)
 
 
 def _timestamp(value: Any) -> Optional[float]:
@@ -79,14 +84,73 @@ class AutoState:
     def save(self, root: Optional[Path] = None) -> None:
         self.prune(time.time())
         destination = Path(root) / "state.json" if root is not None else paths.state_path()
-        paths.atomic_write_json(destination, self.to_dict(), mode=0o600, indent=2)
+        with FileLock(destination.parent / ".lock"):
+            paths.atomic_write_json(destination, self.to_dict(), mode=0o600, indent=2)
 
     def redeemed_last_24h(self, now: float) -> int:
-        return sum(now - _DAY <= entry["at"] <= now for entry in self.redemptions)
+        return sum(
+            now - _DAY <= entry["at"] <= now
+            and entry.get("outcome") not in _UNSPENT_OUTCOMES
+            for entry in self.redemptions
+        )
 
     def prune(self, now: float) -> None:
         recent = [entry for entry in self.redemptions if entry["at"] >= now - 30 * _DAY]
         self.redemptions[:] = sorted(recent, key=lambda entry: entry["at"])[-200:]
+
+
+class RedemptionJournal:
+    """Record a redemption attempt before it is made, and its outcome afterwards.
+
+    The daily cap is shared by every process using the same codexswap home, so it has
+    to be re-checked and the attempt written down under one lock, before the request
+    goes out. Two daemons that each read an empty history would otherwise each spend a
+    credit against a cap of one, and a crash between the request and its answer would
+    leave no record of the attempt at all.
+
+    `persist=False` keeps everything in memory, which is what `tick`'s own unit tests
+    want: no lock, no file, no cap re-check.
+    """
+
+    def __init__(
+        self, state: AutoState, *, root: Optional[Path] = None, persist: bool = True,
+    ) -> None:
+        self.state = state
+        self.root = root
+        self.persist = persist
+
+    def _lock(self) -> FileLock:
+        return FileLock(paths.state_path().parent / ".lock" if self.root is None
+                        else Path(self.root) / ".lock")
+
+    @staticmethod
+    def _key(entry: Dict[str, Any]) -> tuple:
+        return (entry.get("attempt"), entry.get("at"), entry.get("slot"),
+                entry.get("creditId"))
+
+    def _adopt_other_processes(self) -> None:
+        known = {self._key(entry) for entry in self.state.redemptions}
+        for entry in AutoState.load(self.root).redemptions:
+            if self._key(entry) not in known:
+                self.state.redemptions.append(dict(entry))
+
+    def reserve(self, entry: Dict[str, Any], *, cap: int, now: float) -> bool:
+        """Claim one unit of the shared daily allowance, or report that it is gone."""
+        if not self.persist:
+            self.state.redemptions.append(entry)
+            return True
+        with self._lock():
+            self._adopt_other_processes()
+            if cap > 0 and self.state.redeemed_last_24h(now) >= cap:
+                return False
+            self.state.redemptions.append(entry)
+            self.state.save(self.root)
+            return True
+
+    def settle(self, entry: Dict[str, Any]) -> None:
+        """Persist the outcome the caller has already written into `entry`."""
+        if self.persist:
+            self.state.save(self.root)
 
 
 @dataclass(frozen=True)
@@ -106,8 +170,11 @@ def tick(
     redeemer: Callable[[Account, str], str],
     activator: Callable[[Account], Any],
     dry_run: bool = False,
+    journal: Optional[RedemptionJournal] = None,
 ) -> TickResult:
     """Evaluate one tick using injected operations; persistence belongs to run()."""
+    if journal is None:
+        journal = RedemptionJournal(state, persist=False)
 
     def result(action: str, detail: str, slot: Optional[int] = None) -> TickResult:
         prefix = "[dry-run] " if dry_run else ""
@@ -171,11 +238,12 @@ def tick(
             store.record_usage(account.slot, snapshot)
             state.unhealthy[account.slot] = 0
         candidates.append(strategy.Candidate(account, snapshot))
+    # CONTRACT: the reset policy asks whether another account still has headroom,
+    # which is the plain threshold. Hysteresis is a switch-target rule, and applying it
+    # here spent a credit while an account at 75% sat idle under a threshold of 80.
+    # Unknown usage counts as headroom: never spend a credit on a maybe.
     alternatives_available = any(
-        strategy.eligible(
-            candidate, current_slot=active_slot, threshold=settings.threshold,
-            hysteresis=settings.hysteresis_pct,
-        )
+        candidate.percent is None or candidate.percent < settings.threshold
         for candidate in candidates
     )
 
@@ -190,18 +258,28 @@ def tick(
             detail = resets.describe(decision)
             if dry_run:
                 return result("redeemed", detail, active_slot)
-            outcome = redeemer(active_account, decision.credit.id)
-            if resets.outcome_is_success(outcome):
-                # The snapshot just used is now wrong in every field; drop it so the
-                # next tick and any concurrent `list` re-probe instead of trusting it.
-                store.forget_usage(active_account.slot)
-                state.redemptions.append({
-                    "at": now, "slot": active_slot,
-                    "creditId": decision.credit.id, "outcome": outcome,
-                })
-                state.cooldown_until = now + settings.cooldown_seconds
-                return result("redeemed", detail, active_slot)
-            _logger.warning("reset redemption failed for slot %s: %s", active_slot, outcome)
+            # Write the attempt down before making it. A crash after this point leaves
+            # a "pending" entry that still counts against the cap, because nothing
+            # proves the credit survived.
+            entry: Dict[str, Any] = {
+                "at": now, "slot": active_slot, "creditId": decision.credit.id,
+                "attempt": str(uuid.uuid4()), "outcome": "pending",
+            }
+            if not journal.reserve(entry, cap=settings.reset_max_per_day, now=now):
+                _logger.info("reset redemption skipped: another process used the cap")
+            else:
+                outcome = redeemer(active_account, decision.credit.id)
+                entry["outcome"] = outcome
+                journal.settle(entry)
+                if resets.outcome_is_success(outcome):
+                    # The snapshot just used is now wrong in every field; drop it so
+                    # the next tick and any concurrent list re-probe rather than
+                    # trusting it.
+                    store.forget_usage(active_account.slot)
+                    state.cooldown_until = now + settings.cooldown_seconds
+                    return result("redeemed", detail, active_slot)
+                _logger.warning("reset redemption failed for slot %s: %s",
+                                active_slot, outcome)
 
     # 8. The shared strategy also enforces hysteresis and unknown-usage ordering.
     target = strategy.pick_target(
@@ -334,9 +412,13 @@ def run(
                 # running daemon; a stale policy would keep spending reset credits.
                 settings = overrides(Settings.load())
                 store = AccountStore.load()
+                # Reload state too: the daily cap is shared with any other process
+                # using this home, and its history lives only in state.json.
+                state = AutoState.load()
                 accounts = _AutoAccounts(store, settings, now)
                 result = tick(
                     accounts, settings, state, now=now, probe=accounts.probe,
+                    journal=RedemptionJournal(state, persist=not dry_run),
                     redeemer=lambda account, credit_id, store=store, timeout=(
                         settings.probe_timeout
                     ): resets.redeem(

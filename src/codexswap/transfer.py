@@ -82,6 +82,7 @@ def import_accounts(
     remaps: List[Tuple[int, int]] = []
     destinations: Dict[int, int] = {}
     with FileLock(store._path(paths.lock_path())):
+        store.reload()
         had_active = store.active_slot is not None
         cache = store._read_usage_cache()
         for entry, derived in validated:

@@ -162,7 +162,13 @@ def test_deterministic_account_state_machine(monkeypatch):
             # No unconditional save here: it would conceal missing persistence.
             assert_invariants(store, expected, expected_active, removed_slots)
         assert {event["op"] for event in history} == set(OPERATIONS)
-        assert time.monotonic() - started < 10
+        # A blow-up guard, not a performance target. Each mutation fsyncs, which costs
+        # about 10 ms on a quiet Windows box and several times that on a loaded one or
+        # a shared CI runner, so the floor here is roughly 330 * 30 ms. The budget is
+        # set well above that: it still catches an accidental O(n^2), which is what
+        # this assertion is for, without failing because the machine was busy.
+        elapsed = time.monotonic() - started
+        assert elapsed < 60, f"{elapsed:.1f}s for {len(schedule) + 3} operations"
     except Exception:
         print(f"Replay seed: {SEED} ({SEED:#x})")
         print("Exact operation sequence (synthetic identity numbers, no tokens):")

@@ -3,11 +3,13 @@ from __future__ import annotations
 import ast
 import errno
 import json
+import os
 import socket
 import sys
+import sysconfig
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Queue
@@ -154,6 +156,17 @@ def local_backend(monkeypatch):
     assert not blocked, "A backend call attempted to leave the local test server"
 
 
+def _interpreter_dirs():
+    """Directories the running interpreter loads its own code from."""
+    candidates = {sys.prefix, sys.base_prefix, os.path.dirname(os.__file__)}
+    for name in ("stdlib", "platstdlib", "purelib", "platlib"):
+        with suppress(KeyError):
+            candidates.add(sysconfig.get_paths()[name])
+    return tuple(sorted(
+        os.path.normcase(os.path.abspath(path)) + os.sep for path in candidates if path
+    ))
+
+
 @pytest.fixture(scope="module")
 def filesystem_guard():
     """Reject file access during backend calls, including pathlib and os APIs."""
@@ -164,11 +177,22 @@ def filesystem_guard():
         "os.rename", "os.link", "os.symlink", "os.truncate", "os.chmod",
         "os.chown", "os.utime", "os.setxattr", "os.removexattr",
     }
+    # CPython lazily imports codec modules from inside socket.getaddrinfo, so a read
+    # under the interpreter's own directories is an import, not the backend touching
+    # user data. Anything else, the Codex home above all, still fails this test.
+    # Do not build a traceback here: linecache would open the source and re-enter.
+    ignored = _interpreter_dirs()
 
     def audit(event, args):
-        if active and event in file_events:
-            attempts.append(event)
-            raise AssertionError("Backend attempted filesystem access: " + event)
+        if not active or event not in file_events or not args:
+            return
+        if not isinstance(args[0], (str, bytes, os.PathLike)):
+            return
+        target = os.path.normcase(os.path.abspath(os.fsdecode(args[0])))
+        if target.startswith(ignored):
+            return
+        attempts.append(f"{event}({target})")
+        raise AssertionError("Backend attempted filesystem access: " + attempts[-1])
 
     # Python audit hooks cannot be removed; this hook is inert outside the
     # tightly scoped call below, including all subsequent test modules.
