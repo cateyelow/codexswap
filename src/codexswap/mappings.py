@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -11,8 +12,16 @@ from .locking import FileLock
 
 
 def normalise_path(p: Union[str, Path]) -> str:
+    # Anchor to the working directory FIRST. On Python 3.9 for Windows,
+    # Path.resolve() leaves a non-existent relative path relative (bpo-38671, fixed
+    # in 3.10), which would silently store a relative key that never matches again.
+    absolute = os.path.abspath(str(Path(p).expanduser()))
+    # An unreachable drive or a too-long path keeps the plain absolute form, which is
+    # still a usable key.
+    with contextlib.suppress(OSError):
+        absolute = str(Path(absolute).resolve())
     # CONTRACT: preserve the separator of a filesystem root so it stays absolute.
-    result = os.path.normpath(str(Path(p).expanduser().resolve()))
+    result = os.path.normpath(absolute)
     return result.casefold() if os.name == "nt" else result
 
 
