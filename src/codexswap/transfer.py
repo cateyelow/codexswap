@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -66,7 +67,15 @@ def import_accounts(
             raise errors.UserError("Export account disabled flag must be a boolean")
         if not isinstance(entry.get("auth"), dict):
             raise errors.UserError("Export account must contain an auth object")
+        # Reject here, in the validation pass, so a bad entry cannot overwrite a
+        # stored credential that --force would otherwise replace mid-import.
+        identity.validate_auth(entry["auth"], source=f"Export account in slot {source}")
         derived = identity.identity_from_auth(entry["auth"])
+        if derived.auth_mode == "apikey":
+            email = entry.get("email")
+            if email is not None and not isinstance(email, str):
+                raise errors.UserError("Export account email must be a string or null")
+            derived = replace(derived, email=email, plan_type="api key")
         validated.append((entry, derived))
         seen.add(source)
 
@@ -84,6 +93,7 @@ def import_accounts(
             account = Account(slot=destination, identity=derived, alias=entry.get("alias"),
                               disabled=entry.get("disabled", False), added_at=paths.iso_now())
             paths.ensure_dir(store._path(paths.slot_home(destination)))
+            store.seed_config(destination)
             paths.atomic_write_json(store._path(paths.slot_auth_path(destination)),
                                     entry["auth"], mode=0o600)
             store.accounts[destination] = account

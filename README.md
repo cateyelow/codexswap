@@ -64,11 +64,36 @@ its authentication, caches, and other local state there. Probes and
 `codexswap run <ref>` point Codex at that slot, so token refreshes performed by
 Codex land back in the correct slot automatically.
 
+Each slot keeps its own **`config.toml`**, seeded from the current live Codex home
+when an account is added or imported. This carries your model, reasoning effort,
+MCP servers, personality, and trusted projects into `codexswap run`. If the live
+config is absent, no config is created. Existing slot configs are always preserved
+on re-add/import, since accounts may need different MCP credentials.
+
+To update existing slots after changing the live config:
+
+```sh
+codexswap sync-config                   # Fill missing configs; report conflicts.
+codexswap sync-config work              # Process just this account.
+codexswap sync-config --from /path/to/config.toml
+codexswap sync-config work --force      # Explicitly overwrite a different copy.
+```
+
+`--from` also accepts a Codex home directory. Every slot gets a result line;
+identical copies are left alone. Skipped conflicts or destination failures return
+exit 1; a missing/unreadable source returns 2. Switching accounts does not copy
+slot configuration back into the live home.
+
 Switching the normal, live account also updates `~/.codex/auth.json`. **Before a
 switch, the live `auth.json` is copied back into the slot it belongs to**, preserving
 tokens refreshed by the live session. This avoids losing refreshed credentials
-when restoring an older saved file. Switching refuses while Codex is running
-unless you explicitly use `--force`.
+when restoring an older saved file. When both copies carry Codex's `last_refresh`
+stamp, the newer one is kept, so a slot refreshed by a probe is not written backwards.
+
+Switching refuses while Codex is running unless you explicitly use `--force`, and it
+also refuses when it cannot tell whether Codex is running, because a wrong answer there
+costs you the live login. A slot whose `auth.json` parses but holds no usable
+credential is rejected before the live file is touched.
 
 Usage and reset credits come from the supported `codex app-server` JSON-RPC method
 `account/rateLimits/read`; redemption uses
@@ -90,6 +115,11 @@ ambiguous reference reports the matching candidates.
 | `codexswap status [--json]` | Show the active account (aliases: `current`, `st`). |
 | `codexswap switch [<ref>] [--strategy best\|next-available] [--force] [--json]` | Activate an account, select by usage strategy, or rotate to the next slot when neither is given. |
 | `codexswap add [--slot N] [--alias NAME]` | Save the live login in a slot; re-adding an existing email updates its slot. |
+| `codexswap add-token [TOKEN\|-] [--slot N] [--email EMAIL] [--alias NAME]` | Register an API key from stdin, an inline argument, or a hidden prompt. |
+| `codexswap sync-config [<ref>] [--from PATH] [--force]` | Seed or explicitly update slot config files; report differing copies. |
+| `codexswap doctor [--json]` | Diagnose paths, Codex startup, account files, settings, locks, processes, and disk space. |
+| `codexswap watch [--interval N]` | Refresh the account list until Ctrl+C; defaults to 30 seconds (5..3600). |
+| `codexswap upgrade [--yes] [--json]` | Detect uv/pipx/pip installation and confirm a self-upgrade. |
 | `codexswap remove <ref>` | Remove a saved account (alias: `rm`). |
 | `codexswap disable <ref>` | Exclude an account from automatic selection while keeping it stored. |
 | `codexswap enable <ref>` | Return a disabled account to automatic selection. |
@@ -111,6 +141,52 @@ ambiguous reference reports the matching candidates.
 Global flags: `--debug`, `--version`, `--no-color`, and `--home PATH`. The last
 overrides the `CODEXSWAP_HOME` storage root, which otherwise defaults to
 `~/.codexswap`.
+
+## API-key accounts
+
+Register without putting the key in shell history:
+
+```sh
+codexswap add-token --alias service     # Hidden prompt on a terminal.
+your-secret-provider | codexswap add-token - --alias service
+```
+
+The stdin form reads exactly one line. An inline token is also accepted, but can
+appear in shell history. Keys are stored in `auth.json` with mode `0600` on POSIX
+and are never printed or validated over the network. An empty key is rejected.
+`--email` supplies a label; the default is `api-key-<slot>@token.local`. Occupied
+slots and duplicate emails are rejected. Registration leaves the active account
+and live auth alone; use `codexswap switch service` to activate it.
+
+API-key accounts show plan **`api key`** and **usage unavailable** (`null` in JSON).
+They do not have ChatGPT rate limits or reset credits, so this is normal. Both
+automatic selection strategies reserve them for when every other candidate is
+ineligible. Eligible ordinary accounts with unknown usage still take priority;
+failed ordinary probes are excluded by auto mode. Manual references and bare
+`switch` rotation can select API-key accounts directly. Assigned email labels
+survive display refreshes and export/import.
+
+## Diagnostics, watching, and upgrades
+
+`codexswap doctor` reports named `ok`, `warn`, or `fail` checks. It returns 1 for
+any failure and 0 otherwise. `doctor --json` emits one object with a `checks` array.
+The Codex version and app-server initialization checks use a temporary Codex home
+and a five-second timeout per call. Doctor never reads usage or redeems credits,
+and it leaves corrupt files in place for inspection. Process detection is best
+effort; only PIDs appear. Unknown settings, a busy lock, non-private auth modes on
+POSIX, and less than 100 MiB free disk space are warnings.
+
+`codexswap watch --interval 5` refreshes the list every five seconds, respecting
+the normal usage cache. A colour-enabled terminal clears between frames; redirected
+output or disabled colour produces timestamped separators. Probe failures do not
+stop the loop. Press Ctrl+C to exit successfully. This uses standard-library ANSI
+output and works on Windows without curses.
+
+`codexswap upgrade` prints the exact detected uv, pipx, or Python/pip command and
+asks before running it; `--yes` confirms execution. Declining or EOF cancels it.
+Source/editable checkouts and ambiguous installations list all three candidate
+commands and exit 2 without running anything, even with `--yes`. In `--json` mode,
+stdout contains one result object; prompts and package-manager output go to stderr.
 
 ## Reset credits
 
@@ -170,6 +246,10 @@ the lowest usage, breaking ties by lowest slot number. `next-available` walks sl
 order from the current account and wraps around. Unknown usage is eligible but
 ranks last under `best`.
 
+API-key accounts are considered only after all ordinary candidates are ineligible,
+under both strategies. Their unavailable usage is a successful empty reading, so
+it does not accumulate authentication failures or permit reset redemption.
+
 After either a switch or a redemption, the default 300-second cooldown pauses
 decisions. If the active account's probe fails, the daemon waits for 3 consecutive
 failed ticks before treating it as unusable and trying selection. A successful
@@ -191,7 +271,11 @@ codexswap auto --once --dry-run
 ```
 
 Dry runs perform reads and decisions, but neither switch accounts nor redeem
-credits.
+credits, and they write nothing: `state.json` is neither created nor changed.
+
+A running `codexswap auto` re-reads its settings every tick, so `codexswap config set`
+takes effect without restarting it. Values passed as `--interval` or `--threshold` keep
+overriding the file.
 
 An automatic switch rewrites the live credential file. Because the daemon is
 unattended, it does **not** apply the running-process guard that manual
@@ -294,6 +378,13 @@ codexswap config unset autoswitch.threshold
 Boolean values also accept `1`/`0`, `yes`/`no`, and `on`/`off`, case-insensitively.
 Unknown keys and values outside the allowed choices or bounds are rejected.
 
+The same validation applies to values already stored in `settings.json`, in case the
+file was hand-edited or written by an older release. An invalid value is reported once
+on stderr, the documented default is used in its place, and the line stays in the file
+until you set that key again. `reset.policy` is the exception to falling back: an
+unrecognised policy disables automatic redemption entirely rather than applying the
+default rule to credits you cannot get back.
+
 ## JSON output for scripting
 
 ```sh
@@ -392,6 +483,10 @@ files. Token-status output contains derived facts, not raw token values.
 files private, and never attach them or `auth.json` to an issue. Redact email
 addresses from diagnostic output before sharing it.
 
+API-key exports also contain the raw API key. Config files can contain MCP
+credentials and are written privately on POSIX; account exports omit them. An
+import seeds a missing config from the destination machine's live Codex home.
+
 ## Troubleshooting
 
 - **`codex CLI not found on PATH`:** Install Codex and make it available in the
@@ -400,9 +495,12 @@ addresses from diagnostic output before sharing it.
   `$env:CODEX_BIN = 'C:\path\to\codex.exe'` in PowerShell. Services need their own
   persistent environment configuration.
 - **A switch is refused because Codex is running:** The error lists the process
-  IDs. Close those sessions and retry. To override the guard deliberately, use
-  `codexswap switch 2 --force`. This does not guarantee that a running session
-  reloads its credentials.
+  IDs, up to four of them plus a count. Close those sessions and retry. To override
+  the guard deliberately, use `codexswap switch 2 --force`. This does not guarantee
+  that a running session reloads its credentials.
+- **A switch is refused with "cannot determine whether Codex is running":** the
+  process listing tools were unavailable or timed out. Close Codex and retry, or use
+  `--force` once you are sure no session is open.
 - **A probe times out on a cold `CODEX_HOME`:** Codex may be downloading its model
   cache and creating initial state. Raise the timeout, for example with
   `codexswap config set probe.timeoutSeconds 120`, and retry

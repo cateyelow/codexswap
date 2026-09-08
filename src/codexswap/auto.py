@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from . import errors, paths, resets, strategy
 from .models import Account, UsageSnapshot
@@ -192,6 +192,9 @@ def tick(
                 return result("redeemed", detail, active_slot)
             outcome = redeemer(active_account, decision.credit.id)
             if resets.outcome_is_success(outcome):
+                # The snapshot just used is now wrong in every field; drop it so the
+                # next tick and any concurrent `list` re-probe instead of trusting it.
+                store.forget_usage(active_account.slot)
                 state.redemptions.append({
                     "at": now, "slot": active_slot,
                     "creditId": decision.credit.id, "outcome": outcome,
@@ -234,6 +237,64 @@ def _append_log(line: str) -> None:
         paths.atomic_write_text(destination, tail, mode=0o600)
 
 
+class _AutoAccounts:
+    """Adapt the existing tick engine to API-key accounts without probing their usage."""
+
+    def __init__(self, store, settings, now):
+        self.store, self.settings, self.now = store, settings, now
+        self.readings: Dict[int, UsageSnapshot] = {}
+        self.failures: Set[int] = set()
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    def cached_usage(self, slot, **kwargs):
+        # Always re-evaluate API-key eligibility; they have no real usage cache.
+        if self.store.get(slot).identity.auth_mode == "apikey":
+            return None
+        return self.readings.get(slot) or self.store.cached_usage(slot, **kwargs)
+
+    def probe(self, account):
+        from . import appserver, strategy
+
+        if account.identity.auth_mode != "apikey":
+            if account.slot in self.failures:
+                raise errors.AppServerError("usage probe failed")
+            if account.slot not in self.readings:
+                try:
+                    self.readings[account.slot] = appserver.probe_usage(
+                        self.store._path(paths.slot_home(account.slot)),
+                        timeout=self.settings.probe_timeout,
+                    )
+                except (errors.CodexSwapError, OSError):
+                    self.failures.add(account.slot)
+                    raise
+            return self.readings[account.slot]
+        if account.slot != self.store.active_slot:
+            for other in self.store.enabled_accounts():
+                if other.slot == self.store.active_slot or other.identity.auth_mode == "apikey":
+                    continue
+                snapshot = self.cached_usage(other.slot, max_age=self.settings.probe_stale_seconds,
+                                             now=self.now)
+                if snapshot is None:
+                    try:
+                        snapshot = self.probe(other)
+                    except (errors.CodexSwapError, OSError):
+                        continue
+                if strategy.eligible(strategy.Candidate(other, snapshot),
+                                     current_slot=self.store.active_slot,
+                                     threshold=self.settings.threshold,
+                                     hysteresis=self.settings.hysteresis_pct):
+                    # CONTRACT: the tick engine excludes failed candidate probes.
+                    # Suppress this API-key candidate whenever an ordinary one qualifies.
+                    raise errors.AppServerError("API key reserved as a last-resort target")
+        return UsageSnapshot.from_api({}, fetched_at=self.now)
+
+    def record_usage(self, slot, snapshot):
+        if self.store.get(slot).identity.auth_mode != "apikey":
+            self.store.record_usage(slot, snapshot)
+
+
 def run(
     *,
     once: bool = False,
@@ -242,34 +303,26 @@ def run(
     threshold: Optional[int] = None,
     log: Callable[[str], None] = print,
 ) -> int:
+    """The daemon loop: one implementation, so a fix here cannot miss a second copy."""
     # Importing auto itself must not require a Codex binary or switcher setup.
-    from . import appserver, switcher
+    from . import switcher
 
     def emit(result: TickResult, *, now: float) -> None:
         line = format_tick(result, now=now)
         log(line)
         _append_log(line)
 
-    try:
-        settings = Settings.load()
+    def overrides(settings: Settings) -> Settings:
+        # Command-line values outrank the file on every reload, not just the first.
         if interval is not None:
             settings.set("autoswitch.intervalSeconds", str(interval))
         if threshold is not None:
             settings.set("autoswitch.threshold", str(threshold))
+        return settings
+
+    try:
+        settings = overrides(Settings.load())
         state = AutoState.load()
-
-        def probe(account: Account) -> UsageSnapshot:
-            return appserver.probe_usage(
-                paths.slot_home(account.slot), timeout=settings.probe_timeout,
-            )
-
-        def redeemer(account: Account, credit_id: str) -> str:
-            return resets.redeem(paths.slot_home(account.slot), credit_id=credit_id)
-
-        def activator(target: Account) -> None:
-            # The unattended daemon must be able to switch while Codex is running.
-            switcher.activate(store, target, force=True, sync_back=True)
-
         consecutive_failures = 0
         previous_action: Optional[str] = None
         idle_ticks = 0
@@ -277,11 +330,24 @@ def run(
             now = time.time()
             delay = settings.interval_seconds
             try:
-                # Reload the registry so external switches and additions are visible.
+                # Reload both so `config set` and external switches take effect in a
+                # running daemon; a stale policy would keep spending reset credits.
+                settings = overrides(Settings.load())
                 store = AccountStore.load()
+                accounts = _AutoAccounts(store, settings, now)
                 result = tick(
-                    store, settings, state, now=now, probe=probe,
-                    redeemer=redeemer, activator=activator, dry_run=dry_run,
+                    accounts, settings, state, now=now, probe=accounts.probe,
+                    redeemer=lambda account, credit_id, store=store, timeout=(
+                        settings.probe_timeout
+                    ): resets.redeem(
+                        store._path(paths.slot_home(account.slot)),
+                        credit_id=credit_id, timeout=timeout,
+                    ),
+                    activator=lambda account, store=store: switcher.activate(
+                        # The unattended daemon must switch while Codex is running.
+                        store, account, force=True, sync_back=True,
+                    ),
+                    dry_run=dry_run,
                 )
             except errors.CodexSwapError as exc:
                 consecutive_failures += 1
@@ -301,7 +367,9 @@ def run(
                     idle_ticks = 0
                 previous_action = result.action
             finally:
-                state.save()
+                # A dry run reports what would happen; it must leave nothing behind.
+                if not dry_run:
+                    state.save()
             if once:
                 return 0
             time.sleep(delay)

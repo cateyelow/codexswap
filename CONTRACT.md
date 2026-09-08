@@ -25,10 +25,20 @@ the simplest behaviour consistent with the rest of the document and add a short
 - Never log, print, or serialise raw tokens. When a token must be referenced, show
   `tok[:8] + "..."` only. `--token-status` prints *derived* facts (expiry, source), not
   token material.
+  API keys must never appear in output, even as a prefix. Credential storage and
+  the explicit credential export format are the exceptions to serialisation.
 - Files containing credentials are written with mode `0o600` on POSIX. On Windows,
   `os.chmod` is mostly a no-op; that is accepted, do not attempt ACL surgery.
 - All writes to shared state go through `paths.atomic_write_*` (temp file in the same
   directory + `os.replace`) so a crash cannot truncate state.
+- **Fail closed on anything irreversible.** Losing the live credential and spending a
+  reset credit cannot be undone, so when the program cannot establish that an action is
+  safe it refuses instead of guessing:
+  - a credential is validated (`identity.validate_auth`) before it is written anywhere;
+  - a settings value that fails validation is reported as its default, and
+    `reset.policy` in `Settings.invalid` disables automatic redemption entirely;
+  - failed process discovery returns `None`, not "nothing is running";
+  - sync-back keeps the newer of two credential copies rather than overwriting blindly.
 
 ---
 
@@ -83,6 +93,15 @@ that is expected and harmless.
 
 **This is the foundation of codexswap**: each slot owns a directory that is a complete
 `CODEX_HOME`. Token refreshes performed by Codex land back in the slot automatically.
+
+Each slot also owns its own `config.toml`. Account capture, API-key registration,
+and import seed a missing config from the CURRENT `paths.codex_home()/config.toml`.
+An absent source is harmless. An existing slot config (including on re-add or forced
+import) is preserved. UTF-8 source bytes, including line endings, are preserved;
+writes are atomic and use mode `0600` because MCP configuration can hold credentials.
+Config is never copied back to the live home by switching or running a slot.
+Slot moves/swaps carry the entire home, including config. Explicit removal/purge
+still removes the home as before; config seeding and synchronisation never delete it.
 
 ### 1.4 `codex app-server` JSON-RPC (stdio, newline-delimited JSON)
 
@@ -171,6 +190,7 @@ Root is `$CODEXSWAP_HOME` if set, else `~/.codexswap`.
   codexswap.log          # append log, truncated when it exceeds 2 MB
   homes/<slot>/          # a complete CODEX_HOME per slot
   homes/<slot>/auth.json # authoritative credential for that slot
+  homes/<slot>/config.toml # optional account-specific Codex configuration
   .lock                  # advisory lock file
 ```
 
@@ -310,6 +330,32 @@ Health has exactly one offline question behind it: does the stored credential pa
 The re-login banner is therefore shown only for a slot in `auth_failed` (rejected) or for
 `HEALTH_UNKNOWN` (unreadable), never for a healthy account with a stale billing period.
 
+`appserver` classifies a JSON-RPC `error` whose `code` is 401 or 403, or whose message
+matches the auth markers, as `errors.AuthExpired` rather than `AppServerError`, so a
+credential the server actually rejected reaches `auth_failed` instead of looking like a
+generic fault. Generic JSON-RPC codes (-32000 and below) are deliberately excluded.
+
+### 3.2 Credential safety
+
+Overwriting `auth.json` with something unusable logs the user out of Codex, and the
+original is gone. Three rules keep that from happening:
+
+- `identity.validate_auth(auth, *, source)` raises `errors.AuthFileInvalid` unless the
+  object carries something Codex can actually authenticate with: `tokens.refresh_token`
+  or `tokens.access_token` as a non-empty string, or a non-empty `OPENAI_API_KEY`.
+  `identity.load_auth` only proves the file holds a JSON object, which `{}` and
+  `{"hello": 1}` also satisfy. Every path that writes a credential validates first:
+  `switcher.activate` before touching the live home, and `transfer.import_accounts`
+  during its validation pass, before any slot is overwritten by `--force`.
+- `switcher.detect_running_codex() -> Optional[List[ProcessInfo]]` returns `None` when
+  discovery itself failed (missing tool, timeout, malformed output). `activate` treats
+  `None` as a refusal requiring `--force`; reporting an empty list would let a switch
+  overwrite the credential a live Codex still holds.
+- `switcher.sync_live_to_slot` compares Codex's `last_refresh` stamp on both copies and
+  keeps the newer one. A probe refreshes a slot's own credential, and refresh tokens
+  rotate, so blindly copying an older live file over a newer slot file can void the
+  account. When either stamp is missing or unreadable the live copy wins, as before.
+
 ---
 
 ## 4. Errors (`src/codexswap/errors.py`)
@@ -375,7 +421,10 @@ class SettingSpec:
     maximum: Optional[int]
     help: str
 
+def validate(spec: SettingSpec, value: Any) -> bool   # is a stored JSON value usable?
+
 class Settings:
+    invalid: Dict[str, Any]                        # stored values that failed validate()
     @classmethod
     def load(cls, root: Optional[Path] = None) -> "Settings"
     def get(self, key: str) -> Any                 # UserError on unknown key
@@ -383,10 +432,23 @@ class Settings:
     def set(self, key: str, raw: str) -> Any       # parse+validate, UserError on bad value
     def unset(self, key: str) -> None
     def items(self) -> List[Tuple[str, Any, bool]] # (key, value, is_default)
-    def save(self) -> None
+    def save(self) -> None                         # under the root FileLock
 ```
 
 Bools parse from `true/false/1/0/yes/no/on/off` case-insensitively.
+
+`load()` validates every stored value against its spec, because `settings.json` can be
+hand-edited or written by an older release and these values reach decisions that spend
+reset credits. A value that fails validation:
+
+- is **not** an override: `get()` returns the documented default and `is_default()` is
+  `True`, so `"false"` is not truthy and `maxPerDay: -1` does not remove the cap;
+- is recorded in `Settings.invalid` (key to rejected value) and named in one stderr
+  warning: `warning: ignoring invalid settings, using defaults: <keys>`;
+- is left in the file, so `save()` round-trips it until the user corrects that key.
+
+`Settings.invalid` exists so that an irreversible action can distinguish "unset" from
+"set to nonsense": see rule 0 in section 6.
 
 ---
 
@@ -417,6 +479,11 @@ def decide(
 
 Rules, evaluated in order; the first that fires wins:
 
+0. `reset.policy` is not one of the four documented values, or appears in
+   `Settings.invalid`, gives `(False, None, "policy-invalid")`. It does **not** fall back
+   to the `expiring` default: redemption is irreversible, and a value this build does not
+   understand is not evidence that the user wanted the default rule applied to their
+   credits. `resets.POLICIES` is the tuple of accepted values.
 1. `reset.policy == "never"` gives `(False, None, "policy-never")`.
 2. No available credits gives `(False, None, "no-credits")`.
 3. `redeemed_last_24h >= reset.maxPerDay` when `maxPerDay > 0` gives
@@ -498,15 +565,24 @@ Tick algorithm:
 5. `binding_percent < threshold` gives `("idle", ...)`.
 6. Compute `alternatives_available` by probing other enabled accounts, respecting
    `probe.staleSeconds` for cached snapshots.
-7. Ask `resets.decide(...)`. If it says redeem: redeem, append to `state.redemptions`,
-   set cooldown, return `("redeemed", ...)`.
+7. Ask `resets.decide(...)`. If it says redeem: redeem, drop the slot's cached usage
+   with `store.forget_usage(slot)` (a redemption zeroes both windows and consumes a
+   credit, so every cached number is wrong, not merely stale), append to
+   `state.redemptions`, set cooldown, return `("redeemed", ...)`.
 8. Otherwise pick a target with `strategy.pick_target(...)`. None gives
    `("no-target", ...)`.
 9. Activate, set `state.last_switch_at` and `cooldown_until = now + cooldownSeconds`,
    return `("switched", ...)`.
 
 `dry_run` performs every read and decision but calls neither `redeemer` nor
-`activator`, and prefixes `detail` with `[dry-run] `.
+`activator`, and prefixes `detail` with `[dry-run] `. It also persists nothing: `run`
+skips `state.save()` entirely, so `state.json` is neither created nor modified by a
+dry run. "Show me what would happen" must not itself change what happens next.
+
+`run` reloads `Settings` **and** the registry at the top of every tick, so that
+`config set` and switches made elsewhere take effect in a daemon that is already
+running. `--interval` / `--threshold` are reapplied after each reload, so an explicit
+command-line override always outranks the file.
 
 Hysteresis: a candidate is only a valid target when its
 `binding_percent <= threshold - hysteresisPct`. This prevents ping-ponging between two
@@ -536,6 +612,23 @@ def rotate_next(accounts: Sequence[Account], current_slot: Optional[int]) -> Opt
 - `rotate_next` ignores usage entirely and is what a bare `codexswap switch` uses when
   no strategy is given.
 
+The CLI's strategy switch uses `switcher.pick_target`, which applies the above
+strategy to eligible non-API accounts first, then API-key accounts if none qualify.
+This includes ordinary accounts with unknown usage. Bare rotation and explicit
+references retain their existing behaviour.
+
+The `auto` command uses `auto.run`, the single daemon loop, which wraps the store
+in `auto._AutoAccounts` before calling `auto.tick`. There is deliberately only one
+loop: a second copy would drift, and every daemon fix would have to be made twice. API-key probes are synthetic successful snapshots with no
+usage and no reset credits; no app-server/backend request is made for them and
+no usage cache is retained. An API-key target is excluded while any enabled,
+non-current ordinary account passes the same eligibility test. Failed ordinary
+probes are ineligible, as in `auto.tick`; successful unknown usage remains eligible.
+Both strategies use this priority. An active API-key account has no probe failure
+counter increment and may switch to a qualifying ordinary account; if no target
+exists, the result is `no-target`. Reset policy, dry runs, cooldowns, logging and
+backoff retain the existing tick/daemon semantics.
+
 ---
 
 ## 9. CLI surface (`src/codexswap/cli.py`)
@@ -547,6 +640,11 @@ codexswap list [--json] [--token-status] [--no-probe]      (alias: ls)
 codexswap status [--json]                                  (alias: current, st)
 codexswap switch [<ref>] [--strategy best|next-available] [--force] [--json]
 codexswap add [--slot N] [--alias NAME]
+codexswap add-token [TOKEN|-] [--slot N] [--email EMAIL] [--alias NAME]
+codexswap sync-config [<ref>] [--from PATH] [--force]
+codexswap doctor [--json]
+codexswap watch [--interval N]
+codexswap upgrade [--yes] [--json]
 codexswap remove <ref>                                     (alias: rm)
 codexswap disable <ref>
 codexswap enable <ref>
@@ -597,6 +695,70 @@ Behaviour notes:
   and never touches `~/.codex`.
 
 Exit codes come from the exception table in section 4; success is 0.
+
+### Additional command behaviour
+
+- `add-token` accepts an inline key, `-` for exactly one stdin line, or a hidden
+  `getpass.getpass` prompt on a TTY. Without a token on non-TTY input it raises
+  `UserError` instructing the caller to use `-`. An unavailable hidden prompt does
+  not fall back to echoed input. Leading/trailing whitespace is stripped; an empty
+  key raises `UserError`. There is no network validation. Argument errors and
+  failures must not expose the key, including with `--debug`.
+  It writes exactly `{"auth_mode":"apikey","OPENAI_API_KEY":"<key>","tokens":null}`
+  to the slot auth file with mode `0600`. Next-free/positive slot rules apply;
+  occupied slots and duplicate emails are rejected. Email defaults to
+  `api-key-{slot}@token.local`; labels may not contain the key. Registration does
+  not change the live auth or active slot; use `switch <ref>` to activate it.
+  Display refreshes preserve the assigned email, and `planType`/text plan is
+  `api key`. Usage is `null`/`usage unavailable`, including with cached usage or
+  `--no-probe`; it is not an authentication or probe failure.
+- `sync-config` copies from the live Codex home, or `--from` (a directory containing
+  `config.toml`, or the config file itself). Missing/unreadable/non-UTF-8 source is
+  `UserError` (2). With a ref it processes that slot; otherwise all slots, including
+  disabled ones, in numeric order. It reports one line per slot: `copied`,
+  `unchanged (already identical)`, `skipped (different config.toml; use --force to
+  overwrite)`, `overwritten`, or `failed (cannot read or write config.toml)`.
+  Different configs require `--force`; identical configs are not rewritten even
+  with force. Other slots still run after a destination error. Any skip/failure
+  returns 1; complete success (including no slots with a readable source) returns 0.
+- `doctor` delegates diagnostics to `doctor.collect_checks()`, returning
+  `{"checks":[{"name":"...","status":"ok|warn|fail","detail":"one line"}]}`.
+  Text prints `status: name: detail`. It checks version, Python/platform,
+  resolved homes and writability (nearest existing parent for a missing home),
+  Codex path and `--version`, app-server `initialize`, registry/account count,
+  per-slot auth presence/parse/auth mode/offline health and POSIX permissions,
+  live auth matching (account ID/email or exact private API-key comparison),
+  settings shape/types/ranges and unknown keys, lock, processes, and free disk.
+  Each subprocess version/initialize timeout is 5 seconds; both run in a throwaway
+  `CODEX_HOME`. The only app-server exchange is `initialize`/`initialized`;
+  no usage read, backend call, or credit consumption is permitted.
+  Diagnostics do not quarantine corrupt files or create missing homes/locks.
+  Missing homes/auth, no accounts, unknown setting keys, non-private POSIX modes,
+  a busy lock, running sessions, or less than 100 MiB free are warnings. Invalid
+  registry/settings/auth, unwritable homes, unavailable Codex/handshake, or disk
+  inspection failure are failures. Missing settings use defaults. Process discovery
+  is best effort and reports PIDs only, never command lines. Known credentials and
+  recognised token patterns are redacted from output. Exit 1 if any check fails,
+  otherwise 0. JSON emits exactly one object, even for failed checks.
+- `watch` refreshes the same list view immediately and then sleeps the specified
+  integer interval (default 30, valid 5..3600 seconds; invalid values return 2).
+  Registry and settings reload each frame; normal list caching/probe behaviour
+  applies. With a TTY and enabled colour, frames start with `ESC[2J ESC[H` (without
+  the separating space). Otherwise each frame has a separator and local ISO timestamp.
+  Failed refreshes are retried next frame without exposing exception text.
+  Ctrl+C prints a final newline and exits 0. No curses dependency.
+- `upgrade` detects uv tool/pipx venv paths using `sys.prefix`, `sys.argv[0]`, and
+  package location; otherwise a package in this interpreter's site/dist-packages
+  identifies plain pip. Editable/source checkouts or conflicting evidence are
+  ambiguous. Commands are `uv tool upgrade codexswap`, `pipx upgrade codexswap`,
+  or `<sys.executable> -m pip install --upgrade codexswap`. The exact quoted command
+  prints before confirmation. Only `--yes`, `y`, or `yes` permits execution;
+  EOF/other answers cancel with exit 0. Unknown method lists all three candidates,
+  exits 2 and never runs a manager, even with `--yes`. Start failures exit 1;
+  otherwise propagate the manager exit code. Use subprocess argv without a shell.
+  JSON is one object with `method`, argv `command`, `executed`, and `returnCode`;
+  unknown method also has a `candidates` array of printable commands. Prompts,
+  explanatory messages, and manager stdout/stderr go to stderr in JSON mode.
 
 ### JSON output
 
@@ -681,6 +843,10 @@ Import refuses to overwrite an occupied slot unless `force`; on conflict without
 `force` it allocates the next free slot and reports the remap. A `version` other than
 1 raises `UserError`. The file is written `0o600` because it contains refresh tokens,
 and the CLI prints a warning saying so.
+
+API-key emails and `api key` plan labels survive export/import. Import seeds missing
+slot configs from the destination machine's live Codex home; configs are not included
+in the credential export. Forced import preserves an existing destination config.
 
 ---
 

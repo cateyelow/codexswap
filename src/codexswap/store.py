@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -139,10 +140,86 @@ class AccountStore:
                 account = Account(slot=slot, identity=derived, alias=alias,
                                   added_at=paths.iso_now())
             paths.ensure_dir(self._path(paths.slot_home(account.slot)))
+            self.seed_config(account.slot)
             paths.atomic_write_json(self._path(paths.slot_auth_path(account.slot)),
                                     auth, mode=0o600)
             account.identity = derived
             self.accounts[account.slot] = account
+            self.save()
+            return account
+
+    def seed_config(self, slot: int) -> None:
+        """Seed a missing slot config from the currently selected live home."""
+        destination = self._checked_home(slot) / "config.toml"
+        if destination.exists() or destination.is_symlink():
+            return
+        source = paths.codex_home() / "config.toml"
+        try:
+            content = source.read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeError):
+            raise errors.UserError("Cannot read the live config.toml") from None
+        paths.atomic_write_text(destination, content, mode=0o600)
+
+    def sync_config(
+        self, ref: Optional[str] = None, *, source: Optional[Path] = None,
+        force: bool = False,
+    ) -> List[str]:
+        # CONTRACT: --from accepts either a Codex home or a config file.
+        source = paths.codex_home() if source is None else Path(source).expanduser()
+        if source.is_dir():
+            source = source / "config.toml"
+        try:
+            raw = source.read_bytes()
+            content = raw.decode("utf-8")
+        except (OSError, UnicodeError):
+            raise errors.UserError("Cannot read source config.toml") from None
+        results = []
+        with FileLock(self._path(paths.lock_path())):
+            accounts = [self.resolve(ref)] if ref is not None else self.ordered()
+            for account in accounts:
+                destination = self._checked_home(account.slot) / "config.toml"
+                try:
+                    present = destination.exists() or destination.is_symlink()
+                    if present and destination.read_bytes() == raw:
+                        action = "unchanged (already identical)"
+                    elif present and not force:
+                        action = "skipped (different config.toml; use --force to overwrite)"
+                    else:
+                        paths.atomic_write_text(destination, content, mode=0o600)
+                        action = "overwritten" if present else "copied"
+                except OSError:
+                    # A bad destination must not prevent reporting the other slots.
+                    action = "failed (cannot read or write config.toml)"
+                results.append(f"slot {account.slot}: {action}")
+        return results
+
+    def add_token(
+        self, token: str, *, slot: Optional[int] = None, email: Optional[str] = None,
+        alias: Optional[str] = None,
+    ) -> Account:
+        if not isinstance(token, str) or not token.strip():
+            raise errors.UserError("API key must not be empty")
+        token = token.strip()
+        with FileLock(self._path(paths.lock_path())):
+            # CONTRACT: key registration allocates a new slot; unlike OAuth capture
+            # it has no embedded identity for deduplication and does not activate it.
+            slot = self.next_free_slot() if slot is None else slot
+            self._validate_slot(slot)
+            if slot in self.accounts:
+                raise errors.SlotInUse(f"Slot {slot} is already in use")
+            email = email.strip() if email is not None else f"api-key-{slot}@token.local"
+            if not email or token in email or (alias is not None and token in alias):
+                raise errors.UserError("Account labels must be nonempty and must not contain the API key")
+            if self.find_by_email(email) is not None:
+                raise errors.UserError("An account with that email already exists")
+            auth = {"auth_mode": "apikey", "OPENAI_API_KEY": token, "tokens": None}
+            derived = replace(identity.identity_from_auth(auth), email=email, plan_type="api key")
+            account = Account(slot=slot, identity=derived, alias=alias, added_at=paths.iso_now())
+            self.seed_config(slot)
+            paths.atomic_write_json(self._checked_home(slot) / "auth.json", auth, mode=0o600)
+            self.accounts[slot] = account
             self.save()
             return account
 
@@ -272,6 +349,22 @@ class AccountStore:
             account.last_seen_usage = snapshot
             account.last_seen_at = snapshot.fetched_at
             self.save()
+
+    def forget_usage(self, slot: int) -> None:
+        """Drop the cached snapshot so the next read probes the account again.
+
+        A redeemed reset credit changes both windows and the credit list at once,
+        which makes every cached number wrong immediately rather than merely stale.
+        """
+        with FileLock(self._path(paths.lock_path())):
+            account = self.accounts.get(slot)
+            cache = self._read_usage_cache()
+            if cache.pop(str(slot), None) is not None:
+                self._write_usage_cache(cache)
+            if account is not None:
+                account.last_seen_usage = None
+                account.last_seen_at = None
+                self.save()
 
     def cached_usage(
         self, slot: int, *, max_age: Optional[float] = None,

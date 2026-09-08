@@ -41,6 +41,33 @@ def load_auth(path: Path) -> dict:
     return auth
 
 
+def _nonempty(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() != ""
+
+
+def validate_auth(auth: Any, *, source: str = "authentication data") -> dict:
+    """Reject JSON that parses but could never authenticate Codex.
+
+    `load_auth` only proves the file holds an object. Writing an object with no
+    credential in it into the live home logs the user out, so every path that
+    copies auth into a slot or into `CODEX_HOME` validates first. Only the fields
+    Codex itself needs are required: a refreshable OAuth token pair, or an API key.
+    """
+    if not isinstance(auth, dict):
+        raise errors.AuthFileInvalid(f"{source} must contain a JSON object")
+    tokens = auth.get("tokens")
+    if isinstance(tokens, dict) and (
+        _nonempty(tokens.get("refresh_token")) or _nonempty(tokens.get("access_token"))
+    ):
+        return auth
+    if _nonempty(auth.get("OPENAI_API_KEY")):
+        return auth
+    raise errors.AuthFileInvalid(
+        f"{source} holds no usable credential: expected tokens.refresh_token "
+        "or OPENAI_API_KEY"
+    )
+
+
 def _text(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 

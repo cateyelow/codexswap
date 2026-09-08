@@ -25,9 +25,43 @@ from .models import ResetCredit
 BASE_URL = "https://chatgpt.com/backend-api"
 
 
-def _safe_detail(detail: str, access_token: str) -> str:
-    if access_token:
-        detail = detail.replace(access_token, "[redacted]")
+# Bounded so that redacting a hostile multi-megabyte body cannot stall the caller;
+# only the first 300 characters ever reach the message anyway.
+_MAX_DETAIL = 4096
+# A server-controlled body can echo back part of what we sent, so redacting the whole
+# credential is not enough: a fragment of it is still a credential leak. Nine is the
+# smallest window that leaves ordinary eight-character English words alone.
+_SECRET_WINDOW = 9
+
+
+def _redact_fragments(detail: str, secret: str) -> str:
+    """Blank every span of `detail` that repeats a window of `secret`."""
+    if len(secret) < _SECRET_WINDOW or len(detail) < _SECRET_WINDOW:
+        return detail
+    windows = {secret[i:i + _SECRET_WINDOW] for i in range(len(secret) - _SECRET_WINDOW + 1)}
+    hidden = bytearray(len(detail))
+    for i in range(len(detail) - _SECRET_WINDOW + 1):
+        if detail[i:i + _SECRET_WINDOW] in windows:
+            hidden[i:i + _SECRET_WINDOW] = b"\x01" * _SECRET_WINDOW
+    if not any(hidden):
+        return detail
+    out: List[str] = []
+    index = 0
+    while index < len(detail):
+        if hidden[index]:
+            out.append("[redacted]")
+            while index < len(detail) and hidden[index]:
+                index += 1
+        else:
+            out.append(detail[index])
+            index += 1
+    return "".join(out)
+
+
+def _safe_detail(detail: str, access_token: str, account_id: str = "") -> str:
+    for secret in (access_token, account_id):
+        if secret:
+            detail = detail.replace(secret, "[redacted]")
     detail = re.sub(r"(?i)(\bbearer\s+)[^\s\"'<>]+", r"\1[redacted]", detail)
     detail = re.sub(
         r"(?i)([\"']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|"
@@ -36,12 +70,16 @@ def _safe_detail(detail: str, access_token: str) -> str:
         r"\1[redacted]",
         detail,
     )
-    return re.sub(
+    detail = re.sub(
         r"\b(?:eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?"
         r"|sk-[A-Za-z0-9_-]+|rt\.[A-Za-z0-9._-]+)",
         "[redacted]",
         detail,
     )
+    # Last, because every substitution above can leave a partial credential behind.
+    for secret in (access_token, account_id):
+        detail = _redact_fragments(detail, secret)
+    return detail
 
 
 def _request(
@@ -74,7 +112,8 @@ def _request(
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = _safe_detail(exc.read().decode("utf-8", errors="replace"), access_token)[:300]
+            body = exc.read().decode("utf-8", errors="replace")[:_MAX_DETAIL]
+            detail = _safe_detail(body, access_token, account_id)[:300]
         except (OSError, ValueError):
             pass
         finally:
@@ -89,7 +128,7 @@ def _request(
     except urllib.error.URLError as exc:
         raise errors.BackendError(
             "Undocumented Codex backend request failed: "
-            + _safe_detail(str(exc.reason), access_token)
+            + _safe_detail(str(exc.reason), access_token, account_id)
         ) from None
     except (OSError, ValueError) as exc:
         # JSON/header errors and socket timeouts must not expose response or token data.
@@ -98,7 +137,8 @@ def _request(
                 "Invalid request or JSON response from undocumented Codex backend"
             ) from None
         raise errors.BackendError(
-            "Undocumented Codex backend request failed: " + _safe_detail(str(exc), access_token)
+            "Undocumented Codex backend request failed: "
+            + _safe_detail(str(exc), access_token, account_id)
         ) from None
 
 

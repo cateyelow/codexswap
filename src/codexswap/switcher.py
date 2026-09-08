@@ -6,8 +6,11 @@ import csv
 import io
 import json
 import os
+import re
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, List, Mapping, Optional, Sequence, Set
 
 from . import errors, identity, paths
@@ -146,7 +149,13 @@ def _windows_processes() -> List[ProcessInfo]:
             and "app-server" not in process.cmdline.casefold()]
 
 
-def detect_running_codex() -> List[ProcessInfo]:
+def detect_running_codex() -> Optional[List[ProcessInfo]]:
+    """Codex processes that would fight over the live credential.
+
+    Returns `None`, not an empty list, when discovery itself failed: "no Codex is
+    running" and "the question could not be answered" must not look the same to a
+    caller that is about to overwrite `auth.json`.
+    """
     try:
         if os.name == "nt":
             return _windows_processes()
@@ -177,8 +186,41 @@ def detect_running_codex() -> List[ProcessInfo]:
                 processes.append(ProcessInfo(pid, name, cmdline))
         return sorted(processes, key=lambda process: process.pid)
     except Exception:
-        # Process discovery is best effort, including missing tools or malformed output.
-        return []
+        # A missing tool, a timeout or malformed output means the answer is unknown.
+        # Reporting "nothing is running" here would let a switch overwrite the
+        # credential a live Codex still holds, so callers must decide for themselves.
+        return None
+
+
+def describe_running(processes: Sequence[ProcessInfo], *, limit: int = 4) -> str:
+    """One readable line, however many Codex processes are open."""
+    shown = ", ".join(f"{process.pid} {process.name}" for process in processes[:limit])
+    remaining = len(processes) - limit
+    if remaining > 0:
+        shown += f", and {remaining} more"
+    return f"Codex is running: {shown}"
+
+
+def _last_refresh(auth: Optional[dict]) -> Optional[float]:
+    """Parse Codex's `last_refresh` stamp; None when absent or unreadable."""
+    raw = auth.get("last_refresh") if isinstance(auth, dict) else None
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    # Codex writes nanoseconds; fromisoformat accepts at most microseconds until 3.11.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def current_live_identity() -> Optional[AccountIdentity]:
@@ -217,8 +259,19 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
             account = store.find_by_email(derived.email)
         if account is None:
             return None
+        slot_auth = store._path(paths.slot_auth_path(account.slot))
+        stored: Optional[dict] = None
+        if slot_auth.is_file():
+            with suppress(errors.AuthFileMissing, errors.AuthFileInvalid):
+                stored = identity.load_auth(slot_auth)
+        live_at, stored_at = _last_refresh(auth), _last_refresh(stored)
+        if stored_at is not None and live_at is not None and stored_at > live_at:
+            # A probe refreshed this slot after the live copy was written. Refresh
+            # tokens rotate, so the older live copy may already be void: keep the
+            # newer one rather than writing the account backwards.
+            return account.slot
         paths.ensure_dir(store._path(paths.slot_home(account.slot)))
-        paths.atomic_write_json(store._path(paths.slot_auth_path(account.slot)), auth, mode=0o600)
+        paths.atomic_write_json(slot_auth, auth, mode=0o600)
         account.identity = derived
         store.save()
         return account.slot
@@ -229,19 +282,31 @@ def activate(
 ) -> None:
     if not force:
         processes = detect_running_codex()
+        if processes is None:
+            raise errors.CodexRunning(
+                "Cannot determine whether Codex is running. Close Codex and retry, "
+                "or pass --force"
+            )
         if processes:
-            running = ", ".join(f"{process.pid} {process.name}" for process in processes)
-            raise errors.CodexRunning(f"Codex is running: {running}. Close them or pass --force")
+            raise errors.CodexRunning(f"{describe_running(processes)}. Close them or pass --force")
     with FileLock(store._path(paths.lock_path())):
         target = store.get(target.slot)
-        if sync_back:
-            sync_live_to_slot(store)
         auth_path = store._path(paths.slot_auth_path(target.slot))
         if not auth_path.is_file():
             raise errors.AuthFileMissing(
                 f"No auth file for slot {target.slot}; run codexswap add"
             )
-        auth = identity.load_auth(auth_path)
+        # Validate before anything is written. An auth file that parses but holds no
+        # credential must not cost the user their live login, and must not trigger a
+        # sync-back that the failed switch then leaves half applied.
+        auth = identity.validate_auth(
+            identity.load_auth(auth_path), source=f"Slot {target.slot} auth file"
+        )
+        if sync_back and sync_live_to_slot(store) == target.slot:
+            # Sync-back just rewrote this slot; activate the bytes it left behind.
+            auth = identity.validate_auth(
+                identity.load_auth(auth_path), source=f"Slot {target.slot} auth file"
+            )
         paths.ensure_dir(paths.codex_home())
         paths.atomic_write_json(paths.live_auth_path(), auth, mode=0o600)
         store.active_slot = target.slot
@@ -263,3 +328,15 @@ def run_as(store: AccountStore, account: Account, argv: Sequence[str]) -> int:
     env = slot_env(account.slot)
     env["CODEX_HOME"] = str(store._path(paths.slot_home(account.slot)))
     return subprocess.call([binary] + list(argv), env=env)
+
+
+def pick_target(candidates, *, current_slot, strategy, threshold, hysteresis):
+    from . import strategy as selection
+
+    candidates = list(candidates)
+    ordinary = [candidate for candidate in candidates
+                if candidate.account.identity.auth_mode != "apikey"
+                and selection.eligible(candidate, current_slot=current_slot,
+                                       threshold=threshold, hysteresis=hysteresis)]
+    return selection.pick_target(ordinary or candidates, current_slot=current_slot,
+                                 strategy=strategy, threshold=threshold, hysteresis=hysteresis)

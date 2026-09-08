@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import getpass
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -19,6 +23,13 @@ from .identity import health_of, identity_from_auth, load_auth
 from .models import HEALTH_EXPIRED, UsageSnapshot
 from .settings import Settings
 from .store import AccountStore
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        if getattr(self, "redact_errors", False) or self.prog.endswith(" add-token"):
+            message = "invalid add-token arguments; run codexswap add-token --help"
+        super().error(message)
 
 
 def _global_flags(parser, *, inherited=False):
@@ -40,7 +51,7 @@ def _json_flag(parser, *, inherited=False):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="codexswap", description="Switch between Codex CLI accounts and manage reset credits.",
         epilog="Global flags may precede the command. For run, place them before the account ref; "
                "arguments after -- are passed to Codex.",
@@ -75,6 +86,22 @@ def build_parser() -> argparse.ArgumentParser:
     child = command("add", "Capture the current Codex login")
     child.add_argument("--slot", type=int, metavar="N")
     child.add_argument("--alias", metavar="NAME")
+    child = command("add-token", "Register an API key (prefer stdin or the hidden prompt)")
+    child.add_argument("token", nargs="?", metavar="TOKEN|-")
+    child.add_argument("--slot", type=int, metavar="N")
+    child.add_argument("--email", metavar="EMAIL")
+    child.add_argument("--alias", metavar="NAME")
+    child = command("sync-config", "Copy Codex config.toml into one or all slot homes")
+    child.add_argument("ref", nargs="?")
+    child.add_argument("--from", dest="source", type=Path, metavar="PATH")
+    child.add_argument("--force", action="store_true", help="overwrite different slot configs")
+    child = command("doctor", "Diagnose local setup without reading usage or redeeming credits")
+    _json_flag(child)
+    child = command("watch", "Continuously display accounts and usage")
+    child.add_argument("--interval", type=int, default=30, metavar="N")
+    child = command("upgrade", "Upgrade codexswap using its detected package manager")
+    child.add_argument("--yes", action="store_true", help="confirm running the upgrade")
+    _json_flag(child)
     for name, description, aliases in (
         ("remove", "Remove an account and its slot home", ("rm",)),
         ("disable", "Disable an account for automatic selection", ()),
@@ -143,6 +170,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _cached(store, account, *, max_age, now) -> Optional[UsageSnapshot]:
+    if account.identity.auth_mode == "apikey":
+        return None
     try:
         snapshot = store.cached_usage(account.slot, max_age=max_age, now=now)
         if snapshot is not None:
@@ -172,6 +201,9 @@ def _probe_all(store, settings, *, accounts, force=False, auth_failed=None
     pending = []
     now = time.time()
     for account in accounts:
+        if account.identity.auth_mode == "apikey":
+            results[account.slot] = (None, False)
+            continue
         cached = _cached(store, account, max_age=float("inf"), now=now)
         results[account.slot] = (cached, cached is not None)
         if not force:
@@ -179,10 +211,7 @@ def _probe_all(store, settings, *, accounts, force=False, auth_failed=None
             if fresh is not None:
                 results[account.slot] = (fresh, False)
                 continue
-        if account.identity.auth_mode != "apikey":
-            pending.append(account)
-        else:
-            results[account.slot] = (None, False)
+        pending.append(account)
     if not pending:
         return results
     try:
@@ -230,7 +259,8 @@ def _json_account(account, usage, stale, *, active_slot, auth_failed=()) -> Dict
     # in the enclosing object; absent usage is JSON null.
     return {
         "slot": account.slot, "email": account.identity.email, "alias": account.alias,
-        "disabled": account.disabled, "planType": account.identity.plan_type,
+        "disabled": account.disabled,
+        "planType": "api key" if account.identity.auth_mode == "apikey" else account.identity.plan_type,
         "health": (HEALTH_EXPIRED if account.slot in auth_failed
                    else health_of(account.identity, now=time.time())),
         "usage": None if usage is None else {
@@ -270,9 +300,13 @@ def _show_accounts(args, store, settings, color):
     for account in accounts:
         # A missing or unreadable slot file must not prevent listing the stored account.
         with contextlib.suppress(errors.CodexSwapError, OSError):
-            account.identity = identity_from_auth(
+            derived = identity_from_auth(
                 load_auth(paths.slot_home(account.slot) / "auth.json")
             )
+            if derived.auth_mode == "apikey":
+                derived = replace(derived, email=account.identity.email, plan_type="api key")
+                usages[account.slot] = (None, False)
+            account.identity = derived
     if args.json:
         entries = [_json_account(account, *usages[account.slot], active_slot=store.active_slot,
                                  auth_failed=auth_failed)
@@ -302,7 +336,7 @@ def _switch(args, store, settings):
         accounts = store.enabled_accounts()
         usages = _probe_all(store, settings, accounts=accounts)
         candidates = [strategy.Candidate(account, usages[account.slot][0]) for account in accounts]
-        target = strategy.pick_target(candidates, current_slot=store.active_slot,
+        target = switcher.pick_target(candidates, current_slot=store.active_slot,
                                       strategy=args.strategy, threshold=settings.threshold,
                                       hysteresis=settings.hysteresis_pct)
     if target is None:
@@ -377,6 +411,10 @@ def _reset(args, store, settings, color):
             return 0
     outcome = resets.redeem(paths.slot_home(account.slot), credit_id=credit.id,
                             timeout=settings.probe_timeout)
+    if resets.outcome_is_success(outcome):
+        # Both windows are now zero and one credit is gone. Every cached number for
+        # this slot is wrong, not merely stale, so the next read must probe again.
+        store.forget_usage(account.slot)
     if args.json:
         _print_json({"slot": account.slot, "creditId": credit.id,
                      "outcome": outcome, "dryRun": False})
@@ -453,6 +491,127 @@ def _version():
     return 0
 
 
+def _add_token(args, store):
+    token = args.token
+    if token == "-":
+        token = sys.stdin.readline()
+    elif token is None:
+        if not sys.stdin.isatty():
+            raise errors.UserError("use add-token - to read an API key from stdin")
+        try:
+            # getpass warns before falling back to an echoed input; refuse that fallback.
+            import warnings
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                token = getpass.getpass("OpenAI API key: ")
+        except (EOFError, getpass.GetPassWarning):
+            raise errors.UserError("cannot read a hidden API key; use add-token -") from None
+    try:
+        account = store.add_token(token, slot=args.slot, email=args.email, alias=args.alias)
+    except OSError:
+        raise errors.UserError("Cannot save API-key account") from None
+    print(f"saved slot {account.slot} ({account.display()})")
+    return 0
+
+
+def _watch(args):
+    if not 5 <= args.interval <= 3600:
+        raise errors.UserError("watch interval must be in the range 5..3600 seconds")
+    # Standard-library ANSI/plain output: curses is unavailable on Windows.
+    frame_args = argparse.Namespace(command="list", json=False, no_probe=False, token_status=False)
+    try:
+        while True:
+            settings = Settings.load()
+            color = render.supports_color(sys.stdout, "never" if args.no_color else settings.ui_color)
+            if sys.stdout.isatty() and color:
+                print("\033[2J\033[H", end="", flush=True)
+            else:
+                print("--- " + datetime.now().astimezone().isoformat(timespec="seconds") + " ---")
+            try:
+                _show_accounts(frame_args, AccountStore.load(), settings, color)
+            except Exception:
+                # Never echo a probe exception: subprocess output can contain secrets.
+                print("Accounts: refresh failed; retrying next frame")
+            sys.stdout.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+def _upgrade_method() -> Optional[str]:
+    import codexswap
+
+    locations = [sys.prefix, sys.argv[0], codexswap.__file__ or ""]
+    normalised = ["/" + value.replace("\\", "/").lower().strip("/") + "/"
+                  for value in locations]
+    uv = any("/uv/tools/" in value or "/uv/tool/" in value for value in normalised)
+    pipx = any("/pipx/venvs/" in value for value in normalised)
+    if uv and pipx:
+        return None
+    if uv:
+        return "uv"
+    if pipx:
+        return "pipx"
+    # CONTRACT: a checkout/editable install is ambiguous. Only a package installed
+    # under this interpreter's prefix in site/dist-packages establishes plain pip.
+    package = Path(codexswap.__file__ or "").resolve()
+    prefix = Path(sys.prefix).resolve()
+    if prefix in package.parents and any(
+        part in ("site-packages", "dist-packages") for part in package.parts
+    ):
+        return "pip"
+    return None
+
+
+def _upgrade(args):
+    commands = {"uv": ["uv", "tool", "upgrade", "codexswap"],
+                "pipx": ["pipx", "upgrade", "codexswap"],
+                "pip": [sys.executable, "-m", "pip", "install", "--upgrade", "codexswap"]}
+
+    def display(command):
+        return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+
+    method = _upgrade_method()
+    output = sys.stderr if args.json else sys.stdout
+    if method is None:
+        candidates = [display(command) for command in commands.values()]
+        print("Cannot determine installation method. Candidate commands:", file=output)
+        for candidate in candidates:
+            print("  " + candidate, file=output)
+        if args.json:
+            _print_json({"method": None, "command": None, "candidates": candidates,
+                         "executed": False, "returnCode": 2})
+        return 2
+    command = commands[method]
+    print("will run: " + display(command), file=output, flush=True)
+    accepted = args.yes
+    if not accepted:
+        print("Upgrade codexswap? [y/N] ", end="", file=output, flush=True)
+        try:
+            accepted = input().strip().casefold() in ("y", "yes")
+        except EOFError:
+            accepted = False
+    code = 0
+    executed = False
+    if accepted:
+        try:
+            # In JSON mode send the package manager's entire output to stderr.
+            result = subprocess.run(command, stdout=sys.stderr if args.json else None,
+                                    stderr=sys.stderr if args.json else None, check=False)
+            executed = True
+            code = result.returncode
+        except OSError:
+            print("error: could not start the upgrade command", file=output)
+            code = 1
+    else:
+        print("upgrade cancelled", file=output)
+    if args.json:
+        _print_json({"method": method, "command": command, "executed": executed, "returnCode": code})
+    return code
+
+
 def _dispatch(args, parser):
     if args.command in (None, "help"):
         parser.print_help()
@@ -461,6 +620,20 @@ def _dispatch(args, parser):
         return _version()
     if args.command == "purge":
         return _purge(args)
+    if args.command == "doctor":
+        from .doctor import collect_checks
+
+        report = collect_checks()
+        if args.json:
+            _print_json(report)
+        else:
+            for check in report["checks"]:
+                print("{status}: {name}: {detail}".format(**check))
+        return int(any(check["status"] == "fail" for check in report["checks"]))
+    if args.command == "upgrade":
+        return _upgrade(args)
+    if args.command == "watch":
+        return _watch(args)
     settings = Settings.load()
     if args.command == "config":
         return _config(args, settings)
@@ -468,9 +641,17 @@ def _dispatch(args, parser):
         from . import auto
 
         return auto.run(once=args.once, dry_run=args.dry_run, interval=args.interval,
-                        threshold=args.threshold, log=print)
+                                 threshold=args.threshold, log=print)
     color = render.supports_color(sys.stdout, "never" if args.no_color else settings.ui_color)
     store = AccountStore.load()
+    if args.command == "add-token":
+        return _add_token(args, store)
+    if args.command == "sync-config":
+        lines = store.sync_config(args.ref, source=args.source, force=args.force)
+        for line in lines:
+            print(line)
+        # CONTRACT: conflicts are reported partial success (1); no slots is success.
+        return int(any(": skipped" in line or ": failed" in line for line in lines))
     if args.command in ("list", "status", "probe"):
         return _show_accounts(args, store, settings, color)
     if args.command == "switch":
@@ -571,6 +752,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     overridden = False
     try:
         parser = build_parser()
+        parser.redact_errors = "add-token" in arguments
         # Parse the run prefix separately so `run -- --resume` uses a directory
         # mapping, rather than consuming --resume as the optional account ref.
         args = parser.parse_args(arguments)
@@ -591,6 +773,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
+        if "add-token" in before_separator:
+            print("error: could not register API-key account", file=sys.stderr)
+            return 1
         if debug:
             raise
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)

@@ -16,6 +16,8 @@ OUTCOME_RESET = "reset"
 OUTCOME_NOTHING = "nothingToReset"
 OUTCOME_NO_CREDIT = "noCredit"
 OUTCOME_ALREADY = "alreadyRedeemed"
+OUTCOMES = (OUTCOME_RESET, OUTCOME_NOTHING, OUTCOME_NO_CREDIT, OUTCOME_ALREADY)
+POLICIES = ("never", "expiring", "exhausted", "always")
 
 
 @dataclass(frozen=True)
@@ -34,8 +36,10 @@ def decide(
     alternatives_available: bool,
 ) -> ResetDecision:
     policy = settings.reset_policy
-    if policy not in ("never", "expiring", "exhausted", "always"):
-        policy = "expiring"
+    # Redemption is irreversible, so an unreadable policy fails closed. Falling back
+    # to the default would spend a credit under a rule the user never wrote.
+    if policy not in POLICIES or "reset.policy" in getattr(settings, "invalid", {}):
+        return ResetDecision(False, None, "policy-invalid")
     if policy == "never":
         return ResetDecision(False, None, "policy-never")
     if snapshot.available_reset_count == 0:
@@ -84,6 +88,8 @@ def describe(decision: ResetDecision) -> str:
     # CONTRACT: Decisions carry no usage percent or evaluation time, so descriptions use reasons.
     descriptions = {
         "policy-never": "skipped: automatic credit redemption is disabled",
+        "policy-invalid": "skipped: reset.policy is not one of "
+                          + ", ".join(POLICIES),
         "no-credits": "skipped: no reset credits are available",
         "daily-cap": "skipped: the redemption limit for the last 24 hours has been reached",
         "no-usage-data": "skipped: no usage data is available",

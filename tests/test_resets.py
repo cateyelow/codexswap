@@ -211,22 +211,23 @@ def test_expiry_window_boundary(snapshot, settings, soonest, expiry_days, should
     )
 
 
-@pytest.mark.parametrize("expiry_days,should_redeem,reason", [
-    (2, True, "expiring-soon"), (4, False, "not-expiring"),
-])
-def test_unknown_policy_loaded_from_disk_behaves_as_expiring(
-    snapshot, soonest, swap_home, expiry_days, should_redeem, reason,
+@pytest.mark.parametrize("expiry_days", [2, 4])
+def test_unknown_policy_loaded_from_disk_never_redeems(
+    snapshot, soonest, swap_home, expiry_days,
 ):
+    # Redemption is irreversible. A policy value this build does not understand is
+    # not evidence that the user wanted the default rule applied to their credits.
     (swap_home / "settings.json").write_text(
         json.dumps({"reset": {"policy": "future-policy"}}), encoding="utf-8",
     )
     settings = Settings.load()
-    assert settings.reset_policy == "future-policy"
+    assert settings.reset_policy == "expiring"
+    assert settings.invalid == {"reset.policy": "future-policy"}
     credit = replace(soonest, expires_at=NOW + expiry_days * DAY)
 
     assert_decision(
         decide(replace(snapshot, reset_credits=(credit,)), settings, alternatives=False),
-        should_redeem, reason, credit,
+        False, "policy-invalid", None,
     )
 
 

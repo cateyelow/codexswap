@@ -28,6 +28,24 @@ from .models import UsageSnapshot
 _NOT_FOUND = "codex CLI not found on PATH; install it or set CODEX_BIN"
 _AUTH_MARKERS = ("unauthorized", "401", "login", "refresh token", "not logged in")
 _EOF = object()
+# Codex forwards the upstream HTTP status as the JSON-RPC code for auth failures.
+# The generic JSON-RPC range (-32000 and below) is deliberately excluded: those are
+# ordinary server faults, and treating one as expired would mislabel a healthy account.
+_AUTH_CODES = (401, 403)
+# Kept here rather than imported from resets.py, which imports this module lazily.
+_RESET_OUTCOMES = ("reset", "nothingToReset", "noCredit", "alreadyRedeemed")
+
+
+def _is_auth_error(error: Dict[str, Any]) -> bool:
+    code = error.get("code")
+    if isinstance(code, int) and not isinstance(code, bool) and code in _AUTH_CODES:
+        return True
+    text = " ".join(
+        str(part) for part in (error.get("message"), error.get("data")) if part is not None
+    ).lower()
+    return any(marker in text for marker in _AUTH_MARKERS)
+
+
 _CREDENTIAL = re.compile(
     r"(?i)(\bbearer\s+)[^\s\"'<>]+"
     r"|((?:[\"']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|"
@@ -291,13 +309,15 @@ class AppServerClient:
                     continue
                 error = response.get("error")
                 if isinstance(error, dict):
-                    raise AppServerError(
-                        self._safe_message(
-                            "{} (code {})".format(
-                                error.get("message", "App-server error"), error.get("code")
-                            )
+                    message = self._safe_message(
+                        "{} (code {})".format(
+                            error.get("message", "App-server error"), error.get("code")
                         )
                     )
+                    if _is_auth_error(error):
+                        # Health must show a rejected credential, not a generic fault.
+                        raise AuthExpired(message + "; re-login for this account")
+                    raise AppServerError(message)
                 return response.get("result")
 
     def read_rate_limits(self) -> UsageSnapshot:
@@ -313,7 +333,9 @@ class AppServerClient:
             result = result.get("outcome", result.get("result"))
             if isinstance(result, dict):
                 result = result.get("outcome")
-        if isinstance(result, str):
+        # Only the four documented outcomes may leave this call. An arbitrary string
+        # would be printed and logged verbatim, straight past the redactor.
+        if isinstance(result, str) and result in _RESET_OUTCOMES:
             return result
         raise AppServerError("Unrecognised app-server reset-credit outcome")
 

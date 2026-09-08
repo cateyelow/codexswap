@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import paths
 from .errors import UserError
+from .locking import FileLock
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,28 @@ SPECS: Dict[str, SettingSpec] = {
 }
 
 
+def validate(spec: SettingSpec, value: Any) -> bool:
+    """Whether a value decoded from JSON is usable for this setting.
+
+    `set()` validates what the user types, but a stored file can be edited by hand
+    or written by an older release. An unvalidated value reaches decisions that
+    spend reset credits, where `"false"` is truthy and `maxPerDay: -1` removes the
+    cap, so anything that does not match the spec is treated as absent.
+    """
+    if spec.type == "bool":
+        return isinstance(value, bool)
+    if spec.type == "int":
+        # bool is a subclass of int; true is not the number 1 for these keys.
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+        if spec.minimum is not None and value < spec.minimum:
+            return False
+        return not (spec.maximum is not None and value > spec.maximum)
+    if not isinstance(value, str):
+        return False
+    return spec.choices is None or value in spec.choices
+
+
 class Settings:
     """Explicit overrides and preserved unknown fields from settings.json."""
 
@@ -99,6 +122,10 @@ class Settings:
         self._path = Path(root) / "settings.json" if root is not None else paths.settings_path()
         self._values: Dict[str, Any] = {}
         self._extra: Dict[str, Any] = {}
+        # Keys whose stored value failed validation. `get` reports the default for
+        # these, but a caller about to spend something irreversible can tell the
+        # difference between "the user never set it" and "the user set nonsense".
+        self.invalid: Dict[str, Any] = {}
 
     @classmethod
     def load(cls, root: Optional[Path] = None) -> "Settings":
@@ -113,14 +140,25 @@ class Settings:
         if not isinstance(data, dict):
             return settings
         settings._extra = copy.deepcopy(data)
-        for key in SPECS:
+        for key, spec in SPECS.items():
             group, name = key.split(".", 1)
             section = settings._extra.get(group)
-            if isinstance(section, dict) and name in section:
-                # CONTRACT: Retain existing values; set() validates newly supplied overrides.
-                settings._values[key] = section.pop(name)
-                if not section:
-                    del settings._extra[group]
+            if not isinstance(section, dict) or name not in section:
+                continue
+            if not validate(spec, section[name]):
+                # Leave it in _extra so save() round-trips the file the user wrote,
+                # and report the default until they correct or overwrite the value.
+                settings.invalid[key] = section[name]
+                continue
+            settings._values[key] = section.pop(name)
+            if not section:
+                del settings._extra[group]
+        if settings.invalid:
+            print(
+                "warning: ignoring invalid settings, using defaults: "
+                + ", ".join(sorted(settings.invalid)),
+                file=sys.stderr,
+            )
         return settings
 
     @staticmethod
@@ -179,7 +217,9 @@ class Settings:
             if not isinstance(data.get(group), dict):
                 data[group] = {}
             data[group][name] = value
-        paths.atomic_write_json(self._path, data, mode=0o644)
+        # Two `config set` commands touching different keys must not lose each other.
+        with FileLock(self._path.parent / ".lock"):
+            paths.atomic_write_json(self._path, data, mode=0o644)
 
     @property
     def threshold(self) -> int:

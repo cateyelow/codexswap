@@ -103,8 +103,11 @@ def _window_label(minutes: int) -> str:
 def _account_lines(account, usage, *, active_slot, color, token_status, now, auth_failed=()):
     snapshot, stale = _usage_pair(usage)
     identity = account.identity
+    if identity.auth_mode == "apikey":
+        snapshot, stale = None, False
     heading = "  {}: {}  [{}]".format(
-        account.slot, _ascii(identity.label()), _ascii(identity.plan_type or "unknown")
+        account.slot, _ascii(identity.label()),
+        "api key" if identity.auth_mode == "apikey" else _ascii(identity.plan_type or "unknown")
     )
     if account.slot == active_slot:
         heading += "  " + colorize("* active", GREEN, enabled=color)
@@ -169,10 +172,11 @@ def render_accounts(accounts, usages, *, active_slot, color, token_status=False,
     return "\n".join(blocks)
 
 
-def render_status(account, usage, *, active_slot, color, now=None) -> str:
+def render_status(account, usage, *, active_slot, color, now=None, auth_failed=()) -> str:
     now = time.time() if now is None else now
     return "\n".join(["Account:"] + _account_lines(
         account, usage, active_slot=active_slot, color=color, token_status=False, now=now,
+        auth_failed=auth_failed,
     ))
 
 

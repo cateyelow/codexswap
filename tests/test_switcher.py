@@ -132,7 +132,7 @@ def test_activate_refuses_running_codex_unless_forced(live_auth, monkeypatch):
     assert switcher.current_live_identity().account_id == target.identity.account_id
 
 
-def test_detect_running_codex_returns_empty_on_oserror(monkeypatch):
+def test_detect_running_codex_reports_unknown_on_oserror(monkeypatch):
     calls = []
 
     def fail(command, **kwargs):
@@ -140,8 +140,24 @@ def test_detect_running_codex_returns_empty_on_oserror(monkeypatch):
         raise OSError("process discovery unavailable")
 
     monkeypatch.setattr(switcher.subprocess, "run", fail)
-    assert switcher.detect_running_codex() == []
+    # None, not [], so that activate can refuse instead of overwriting auth.json
+    # while a Codex session that discovery simply could not see is still holding it.
+    assert switcher.detect_running_codex() is None
     assert calls
+
+
+def test_activate_refuses_when_process_discovery_fails(monkeypatch, swap_home, live_auth):
+    store = AccountStore.load()
+    account = store.add_from_auth(make_auth())
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: None)
+    before = paths.live_auth_path().read_bytes()
+    with pytest.raises(errors.CodexRunning) as caught:
+        switcher.activate(store, account)
+    assert "--force" in str(caught.value)
+    assert paths.live_auth_path().read_bytes() == before
+    # The same unknown answer must not block an explicitly forced switch.
+    switcher.activate(store, account, force=True)
+    assert store.active_slot == account.slot
 
 
 def test_slot_env_overrides_home_and_preserves_other_variables():
