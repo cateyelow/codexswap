@@ -1,0 +1,708 @@
+# codexswap — implementation contract (single source of truth)
+
+`codexswap` is a multi-account switcher for the **OpenAI Codex CLI**, modelled on
+`claude-swap` (`cswap`) for Claude Code, plus a Codex-only feature: management and
+policy-driven redemption of **banked rate-limit reset credits**.
+
+Every module below is implemented against THIS document. Do not invent new shared
+types, rename fields, or change signatures. If something here is ambiguous, choose
+the simplest behaviour consistent with the rest of the document and add a short
+`# CONTRACT:` comment explaining the choice.
+
+---
+
+## 0. Hard constraints
+
+- **Python 3.9+**, **standard library only** at runtime (no requests, no rich, no psutil,
+  no pydantic). `pytest` and `ruff` are dev-only.
+- Must work on **Windows, macOS and Linux**. Windows is a first-class target: this is
+  developed on Windows 11 with Python 3.11 and Git Bash.
+- `from __future__ import annotations` at the top of every module (so `X | None`
+  annotations work on 3.9). Prefer `typing.Optional` / `typing.Tuple` in runtime-evaluated
+  positions such as dataclass fields on 3.9.
+- No network calls in `appserver.py` (it shells out to the Codex CLI). `backend.py` is
+  the only module that may use `urllib.request`.
+- Never log, print, or serialise raw tokens. When a token must be referenced, show
+  `tok[:8] + "..."` only. `--token-status` prints *derived* facts (expiry, source), not
+  token material.
+- Files containing credentials are written with mode `0o600` on POSIX. On Windows,
+  `os.chmod` is mostly a no-op; that is accepted, do not attempt ACL surgery.
+- All writes to shared state go through `paths.atomic_write_*` (temp file in the same
+  directory + `os.replace`) so a crash cannot truncate state.
+
+---
+
+## 1. Verified facts about Codex (measured on codex-cli 0.153.4, 2026-09-09)
+
+These were verified empirically. Implement against them.
+
+### 1.1 `~/.codex/auth.json`
+
+```json
+{
+  "auth_mode": "chatgpt",
+  "OPENAI_API_KEY": null,
+  "tokens": {
+    "id_token": "<JWT>",
+    "access_token": "<JWT>",
+    "refresh_token": "rt.1.AAD...",
+    "account_id": "109355fb-405e-4d1a-a9c0-670a91fb2c12"
+  },
+  "last_refresh": "2026-09-08T10:57:36.966926600Z"
+}
+```
+
+`auth_mode` may also be `apikey`, in which case `OPENAI_API_KEY` is set and `tokens`
+may be absent or null. Treat api-key accounts as valid accounts with no usage data.
+
+### 1.2 `id_token` JWT payload (base64url, **no signature verification**)
+
+```
+email                                    "person@example.com"
+name                                     "A Person"
+exp, iat                                 unix seconds
+https://api.openai.com/auth              {
+                                           "chatgpt_account_id": "109355fb-...",
+                                           "chatgpt_plan_type": "pro",
+                                           "chatgpt_subscription_active_start": "2026-05-31T02:50:31+00:00",
+                                           "chatgpt_subscription_active_until": "..."
+                                         }
+```
+
+The `access_token` payload additionally has `https://api.openai.com/profile.email` and
+its own `exp`. Use the id_token for identity, the access_token `exp` for health.
+
+### 1.3 `CODEX_HOME`
+
+The Codex CLI honours the `CODEX_HOME` environment variable (default `~/.codex`) for
+**all** of its state, including `auth.json`. Verified: pointing `CODEX_HOME` at a
+directory that contains only `auth.json` lets `codex app-server` authenticate as that
+account and leaves the real `~/.codex` untouched. Codex will populate that directory
+with its own caches (`models_cache.json`, several sqlite files, `installation_id`);
+that is expected and harmless.
+
+**This is the foundation of codexswap**: each slot owns a directory that is a complete
+`CODEX_HOME`. Token refreshes performed by Codex land back in the slot automatically.
+
+### 1.4 `codex app-server` JSON-RPC (stdio, newline-delimited JSON)
+
+Handshake:
+
+```json
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codexswap","version":"0.1.0"}}}
+{"method":"initialized","params":null}
+```
+
+Then request `{"id":2,"method":"account/rateLimits/read"}` (params must be omitted or
+`null`). Verified response shape:
+
+```json
+{"id":2,"result":{
+  "rateLimits":{
+    "limitId":"codex","limitName":null,
+    "primary":{"usedPercent":84,"windowDurationMins":10080,"resetsAt":1789435573},
+    "secondary":null,
+    "credits":{"hasCredits":false,"unlimited":false,"balance":"0"},
+    "individualLimit":null,"spendControlReached":false,
+    "planType":"pro","rateLimitReachedType":null},
+  "rateLimitsByLimitId":{
+    "codex":{"...same shape, plus limitId/limitName...":null},
+    "codex_bengalfox":{"limitId":"codex_bengalfox","limitName":"GPT-5.3-Codex-Spark",
+      "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":1788912388},
+      "secondary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":1789499188},
+      "credits":null,"planType":"pro"}},
+  "rateLimitResetCredits":{
+    "availableCount":3,
+    "credits":[{"id":"RateLimitResetCredit_c527...","resetType":"codexRateLimits",
+                "status":"available","grantedAt":1787358028,"expiresAt":1789950028,
+                "title":"Full reset",
+                "description":"Thanks for using Codex! ..."}]},
+  "accountId":"109355fb-...",
+  "rateLimitUpsell":null}}
+```
+
+Any of `rateLimits`, `secondary`, `credits`, `rateLimitResetCredits`,
+`rateLimitsByLimitId` may be `null` or missing. Parse defensively.
+
+Redemption request:
+
+```json
+{"id":3,"method":"account/rateLimitResetCredit/consume",
+ "params":{"idempotencyKey":"<uuid4>","creditId":"<optional, omit to let backend pick>"}}
+```
+
+Outcome strings (from the binary enum): `reset`, `nothingToReset`, `noCredit`,
+`alreadyRedeemed`. The result object contains an `outcome` field; accept both
+`result.outcome` and a bare string result. **Redeeming a credit resets both the 5-hour
+and the weekly window to 0% and is irreversible.**
+
+Locating the binary: `codex` on PATH (`codex.exe` on Windows). Honour `$CODEX_BIN` as
+an override. On Windows the npm shim is a `.cmd` script, so subprocess calls must not
+set `shell=True`; resolve with `shutil.which("codex")` and fall back to
+`shutil.which("codex.exe")`, then to the npm-installed native binary if discoverable.
+
+### 1.5 Undocumented backend endpoints (fallback only)
+
+Base `https://chatgpt.com/backend-api`, headers
+`Authorization: Bearer <access_token>` and `ChatGPT-Account-Id: <account_id>`.
+
+- `GET  /wham/rate-limit-reset-credits`
+- `POST /wham/rate-limit-reset-credits/consume`  body `{"credit_id":..., "redeem_request_id":...}`
+- `GET  /wham/usage`
+
+These are reverse-engineered and unsupported by OpenAI. They are used **only** when
+the user passes `--backend`, or when the app-server path fails and
+`probe.allowBackendFallback` is true (default **false**). Every code path that uses
+them must be reachable only through those two switches.
+
+---
+
+## 2. Storage layout
+
+Root is `$CODEXSWAP_HOME` if set, else `~/.codexswap`.
+
+```
+<root>/
+  settings.json          # user settings (section 5)
+  accounts.json          # account registry (section 2.1)
+  mappings.json          # directory -> slot map
+  state.json             # auto-daemon state
+  usage-cache.json       # last usage snapshot per slot
+  codexswap.log          # append log, truncated when it exceeds 2 MB
+  homes/<slot>/          # a complete CODEX_HOME per slot
+  homes/<slot>/auth.json # authoritative credential for that slot
+  .lock                  # advisory lock file
+```
+
+### 2.1 `accounts.json`
+
+```json
+{
+  "version": 1,
+  "activeSlot": 1,
+  "accounts": [
+    {
+      "slot": 1,
+      "email": "a@example.com",
+      "name": "A Person",
+      "accountId": "109355fb-...",
+      "planType": "pro",
+      "authMode": "chatgpt",
+      "subscriptionActiveUntil": "2027-05-31T02:50:31+00:00",
+      "alias": "main",
+      "disabled": false,
+      "addedAt": "2026-09-09T03:00:00Z",
+      "lastSwitchedAt": null,
+      "lastSeenAt": 1789435573.0,
+      "lastSeenUsage": {}
+    }
+  ]
+}
+```
+
+A missing file means "no accounts yet" and must not raise. A corrupt file is renamed
+to `accounts.json.corrupt-<timestamp>` and treated as empty, with a warning on stderr.
+
+---
+
+## 3. Shared types (`src/codexswap/models.py`)
+
+All dataclasses. Every type gets `to_dict()` and a `from_dict()` classmethod using the
+exact camelCase keys shown in section 2.1 and the app-server payload. `from_dict` must
+tolerate missing and `None` fields.
+
+```python
+@dataclass(frozen=True)
+class AccountIdentity:
+    email: Optional[str]
+    name: Optional[str]
+    account_id: Optional[str]
+    plan_type: Optional[str]
+    auth_mode: str                      # "chatgpt" | "apikey" | "unknown"
+    subscription_active_until: Optional[str]
+    access_token_exp: Optional[int]     # unix seconds
+    id_token_exp: Optional[int]
+    def label(self) -> str              # email, else account_id[:8], else "unknown"
+
+@dataclass(frozen=True)
+class RateLimitWindow:
+    used_percent: float
+    window_minutes: int
+    resets_at: Optional[int]            # unix seconds
+    def seconds_until_reset(self, now: float) -> Optional[float]
+
+@dataclass(frozen=True)
+class ResetCredit:
+    id: str
+    reset_type: Optional[str]
+    status: str                         # "available" | "redeeming" | "redeemed"
+    granted_at: Optional[int]
+    expires_at: Optional[int]
+    title: Optional[str]
+    description: Optional[str]
+    @property
+    def is_available(self) -> bool      # status == "available"
+    def days_until_expiry(self, now: float) -> Optional[float]
+
+@dataclass(frozen=True)
+class PerLimitUsage:
+    limit_id: str
+    limit_name: Optional[str]
+    primary: Optional[RateLimitWindow]
+    secondary: Optional[RateLimitWindow]
+    plan_type: Optional[str]
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    fetched_at: float
+    account_id: Optional[str]
+    plan_type: Optional[str]
+    primary: Optional[RateLimitWindow]
+    secondary: Optional[RateLimitWindow]
+    has_credits: bool
+    credits_balance: Optional[str]
+    reset_credits: Tuple[ResetCredit, ...]
+    per_limit: Tuple[PerLimitUsage, ...]
+    @property
+    def binding_percent(self) -> Optional[float]
+        # max(used_percent) over primary and secondary; None if both absent
+    @property
+    def available_reset_credits(self) -> Tuple[ResetCredit, ...]
+    @property
+    def available_reset_count(self) -> int
+    def soonest_expiring_credit(self) -> Optional[ResetCredit]
+
+@dataclass
+class Account:
+    slot: int
+    identity: AccountIdentity
+    alias: Optional[str] = None
+    disabled: bool = False
+    added_at: str = ""                  # ISO8601 Z
+    last_switched_at: Optional[str] = None
+    last_seen_at: Optional[float] = None
+    last_seen_usage: Optional[UsageSnapshot] = None
+    def display(self) -> str            # "main (a@example.com)" or "a@example.com"
+    def matches(self, ref: str) -> bool # slot number as str, email (case-insensitive), or alias
+```
+
+Module constants: `HEALTH_OK = "ok"`, `HEALTH_EXPIRED = "expired"`,
+`HEALTH_UNKNOWN = "unknown"`.
+
+### 3.1 What health means
+
+Health has exactly one offline question behind it: does the stored credential parse?
+
+- `identity.health_of(identity, *, now)` returns **only** `HEALTH_OK` or `HEALTH_UNKNOWN`.
+  `HEALTH_UNKNOWN` means the token set is missing or unreadable. An elapsed
+  `access_token_exp` is still `HEALTH_OK`, because Codex refreshes that token on demand.
+- `HEALTH_EXPIRED` means a live call actually rejected the credential. That cannot be
+  judged from a file, so it is only ever attached by a caller that saw `errors.AuthExpired`
+  from a probe. `cli._probe_all` collects those slots into an `auth_failed` set and passes
+  it to `render.render_accounts` / `render.render_status` and into the `--json` `health`
+  field.
+- `identity.subscription_lapsed(identity, *, now)` exists but is **informational only**.
+  The `chatgpt_subscription_active_until` claim records the billing period that was current
+  when the token was issued, and the token is not reissued each period, so an active
+  subscriber routinely carries a timestamp in the past. Deriving health from it produced a
+  false "re-login needed" banner on a working Pro account, which is why it is excluded.
+
+The re-login banner is therefore shown only for a slot in `auth_failed` (rejected) or for
+`HEALTH_UNKNOWN` (unreadable), never for a healthy account with a stale billing period.
+
+---
+
+## 4. Errors (`src/codexswap/errors.py`)
+
+```python
+class CodexSwapError(Exception):           exit_code = 1
+class UserError(CodexSwapError):           exit_code = 2
+class AccountNotFound(UserError)
+class NoAccountsConfigured(UserError)
+class SlotInUse(UserError)
+class CodexRunning(UserError)
+class AuthFileMissing(CodexSwapError)
+class AuthFileInvalid(CodexSwapError)
+class AppServerError(CodexSwapError):      exit_code = 3
+class AppServerTimeout(AppServerError)
+class CodexBinaryNotFound(CodexSwapError): exit_code = 3
+class AuthExpired(CodexSwapError):         exit_code = 4
+class BackendError(CodexSwapError):        exit_code = 5
+class LockBusy(CodexSwapError):            exit_code = 6
+```
+
+`cli.main` catches `CodexSwapError`, prints `error: {msg}` to stderr, returns
+`exc.exit_code`. Unexpected exceptions print a short message plus
+`run with --debug for a traceback`.
+
+---
+
+## 5. Settings (`src/codexswap/settings.py`)
+
+Dotted keys, stored in `settings.json` as a nested dict. Only keys present in the file
+are non-default. `config` prints `key  value  (default)` aligned.
+
+| key | type | default | validation |
+|---|---|---|---|
+| `autoswitch.enabled` | bool | `true` | |
+| `autoswitch.threshold` | int | `80` | 1..100 |
+| `autoswitch.intervalSeconds` | int | `60` | 10..3600 |
+| `autoswitch.cooldownSeconds` | int | `300` | 0..86400 |
+| `autoswitch.hysteresisPct` | int | `10` | 0..50 |
+| `autoswitch.strategy` | str | `best` | `best` or `next-available` |
+| `autoswitch.unhealthyTicks` | int | `3` | 1..20 |
+| `reset.policy` | str | `expiring` | `never`, `expiring`, `exhausted`, `always` |
+| `reset.expiryDays` | int | `3` | 0..30 |
+| `reset.minUsagePercent` | int | `50` | 0..100 |
+| `reset.maxPerDay` | int | `1` | 0..10 |
+| `probe.timeoutSeconds` | int | `45` | 5..300 |
+| `probe.staleSeconds` | int | `120` | 0..86400 |
+| `probe.allowBackendFallback` | bool | `false` | |
+| `ui.color` | str | `auto` | `auto`, `always`, `never` |
+
+API:
+
+```python
+SPECS: Dict[str, SettingSpec]           # ordered as in the table above
+
+@dataclass(frozen=True)
+class SettingSpec:
+    key: str
+    type: str                           # "bool" | "int" | "str"
+    default: Any
+    choices: Optional[Tuple[str, ...]]
+    minimum: Optional[int]
+    maximum: Optional[int]
+    help: str
+
+class Settings:
+    @classmethod
+    def load(cls, root: Optional[Path] = None) -> "Settings"
+    def get(self, key: str) -> Any                 # UserError on unknown key
+    def is_default(self, key: str) -> bool
+    def set(self, key: str, raw: str) -> Any       # parse+validate, UserError on bad value
+    def unset(self, key: str) -> None
+    def items(self) -> List[Tuple[str, Any, bool]] # (key, value, is_default)
+    def save(self) -> None
+```
+
+Bools parse from `true/false/1/0/yes/no/on/off` case-insensitively.
+
+---
+
+## 6. Reset-credit policy (`src/codexswap/resets.py`)
+
+This is the feature that distinguishes codexswap. A banked reset restores **both** the
+5h and weekly windows to 0%, expires 30 days after it is granted, and cannot be
+undone. Wasting one on a lightly used account is the main failure mode to avoid.
+
+```python
+@dataclass(frozen=True)
+class ResetDecision:
+    should_redeem: bool
+    credit: Optional[ResetCredit]
+    reason: str          # machine-ish reason, e.g. "expiring-soon", "policy-never"
+```
+
+```python
+def decide(
+    snapshot: UsageSnapshot,
+    settings: Settings,
+    *,
+    now: float,
+    redeemed_last_24h: int,
+    alternatives_available: bool,   # True if some OTHER enabled account is below threshold
+) -> ResetDecision
+```
+
+Rules, evaluated in order; the first that fires wins:
+
+1. `reset.policy == "never"` gives `(False, None, "policy-never")`.
+2. No available credits gives `(False, None, "no-credits")`.
+3. `redeemed_last_24h >= reset.maxPerDay` when `maxPerDay > 0` gives
+   `(False, None, "daily-cap")`. `maxPerDay == 0` means no cap.
+4. `binding_percent` is None gives `(False, None, "no-usage-data")`.
+5. `binding_percent < reset.minUsagePercent` gives `(False, credit, "usage-too-low")`.
+   Never burn a reset that would mostly be thrown away.
+6. `policy == "expiring"`: redeem only if the soonest-expiring available credit expires
+   within `reset.expiryDays` days, giving `(True, credit, "expiring-soon")`, otherwise
+   `(False, credit, "not-expiring")`.
+7. `policy == "exhausted"`: redeem only when `alternatives_available` is False, giving
+   `(True, credit, "all-accounts-exhausted")`, otherwise
+   `(False, credit, "alternatives-available")`.
+8. `policy == "always"` gives `(True, credit, "policy-always")`.
+
+The chosen credit is always `snapshot.soonest_expiring_credit()` (use-it-or-lose-it
+ordering: credits with an `expires_at` sort before those without).
+
+```python
+def redeem(
+    codex_home: Path, *, credit_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None, timeout: float = 45.0,
+    client_factory=None,   # for tests; defaults to appserver.AppServerClient
+) -> str                   # returns the outcome string
+```
+
+`idempotency_key` defaults to `str(uuid.uuid4())`. Callers that retry the *same logical
+attempt* must pass the same key back in.
+
+---
+
+## 7. Auto daemon (`src/codexswap/auto.py`)
+
+```python
+@dataclass
+class AutoState:
+    last_switch_at: Optional[float] = None
+    cooldown_until: Optional[float] = None
+    unhealthy: Dict[int, int] = field(default_factory=dict)          # slot -> consecutive failures
+    redemptions: List[Dict[str, Any]] = field(default_factory=list)  # {"at":ts,"slot":n,"creditId":...}
+    def to_dict(self) -> Dict[str, Any]
+    @classmethod
+    def from_dict(cls, d) -> "AutoState"
+    @classmethod
+    def load(cls, root: Optional[Path] = None) -> "AutoState"
+    def save(self, root: Optional[Path] = None) -> None
+    def redeemed_last_24h(self, now: float) -> int
+    def prune(self, now: float) -> None       # drop redemptions older than 30 days
+
+@dataclass(frozen=True)
+class TickResult:
+    action: str        # "idle" | "switched" | "redeemed" | "cooldown" | "no-target"
+                       # | "probe-failed" | "disabled" | "no-accounts"
+    detail: str
+    slot: Optional[int] = None
+```
+
+```python
+def tick(store, settings, state, *, now: float, probe, redeemer, activator,
+         dry_run: bool = False) -> TickResult
+def run(*, once: bool = False, dry_run: bool = False, interval: Optional[int] = None,
+        threshold: Optional[int] = None, log=print) -> int
+```
+
+`probe(account) -> UsageSnapshot`, `redeemer(account, credit_id) -> str` and
+`activator(account) -> None` are injected so `tick` is unit-testable with no
+subprocesses. `run` wires the real implementations, handles `KeyboardInterrupt`
+cleanly (exit 0), and sleeps `autoswitch.intervalSeconds` between ticks.
+
+Tick algorithm:
+
+1. `autoswitch.enabled` false gives `("disabled", ...)`.
+2. No enabled accounts gives `("no-accounts", ...)`.
+3. `now < state.cooldown_until` gives `("cooldown", ...)`.
+4. Probe the active account. On failure increment `state.unhealthy[slot]`; once it
+   reaches `autoswitch.unhealthyTicks`, treat the account as unusable and fall through
+   to selection. Reset the counter to 0 on any success. A probe failure that has not
+   yet reached the threshold returns `("probe-failed", ...)`.
+5. `binding_percent < threshold` gives `("idle", ...)`.
+6. Compute `alternatives_available` by probing other enabled accounts, respecting
+   `probe.staleSeconds` for cached snapshots.
+7. Ask `resets.decide(...)`. If it says redeem: redeem, append to `state.redemptions`,
+   set cooldown, return `("redeemed", ...)`.
+8. Otherwise pick a target with `strategy.pick_target(...)`. None gives
+   `("no-target", ...)`.
+9. Activate, set `state.last_switch_at` and `cooldown_until = now + cooldownSeconds`,
+   return `("switched", ...)`.
+
+`dry_run` performs every read and decision but calls neither `redeemer` nor
+`activator`, and prefixes `detail` with `[dry-run] `.
+
+Hysteresis: a candidate is only a valid target when its
+`binding_percent <= threshold - hysteresisPct`. This prevents ping-ponging between two
+accounts that both hover at the threshold.
+
+---
+
+## 8. Selection strategy (`src/codexswap/strategy.py`)
+
+```python
+@dataclass(frozen=True)
+class Candidate:
+    account: Account
+    snapshot: Optional[UsageSnapshot]
+    @property
+    def percent(self) -> Optional[float]
+
+def pick_target(candidates, *, current_slot, strategy, threshold, hysteresis) -> Optional[Account]
+def rotate_next(accounts: Sequence[Account], current_slot: Optional[int]) -> Optional[Account]
+```
+
+- `best`: among candidates that are enabled, not the current slot, and whose `percent`
+  is `<= threshold - hysteresis` (unknown percent counts as eligible but ranks last),
+  return the one with the lowest `percent`. Ties break by lowest slot number.
+- `next-available`: rotate slot order starting after `current_slot`, wrapping, and
+  return the first candidate satisfying the same eligibility test.
+- `rotate_next` ignores usage entirely and is what a bare `codexswap switch` uses when
+  no strategy is given.
+
+---
+
+## 9. CLI surface (`src/codexswap/cli.py`)
+
+```
+codexswap help
+codexswap version
+codexswap list [--json] [--token-status] [--no-probe]      (alias: ls)
+codexswap status [--json]                                  (alias: current, st)
+codexswap switch [<ref>] [--strategy best|next-available] [--force] [--json]
+codexswap add [--slot N] [--alias NAME]
+codexswap remove <ref>                                     (alias: rm)
+codexswap disable <ref>
+codexswap enable <ref>
+codexswap alias [<ref> <name> | <ref> --unset]
+codexswap swap <a> <b>
+codexswap move <ref> <slot>
+codexswap run [<ref>] [-- <codex args>...]
+codexswap map [<ref> [path]]
+codexswap unmap [path]
+codexswap probe [<ref>] [--json]
+codexswap reset [list] [--json]
+codexswap reset use [<ref>] [--credit ID] [--yes] [--dry-run]
+codexswap auto [--once] [--dry-run] [--interval N] [--threshold N]
+codexswap config [set <KEY> <VALUE> | unset <KEY>] [--json]
+codexswap export <path> [--account <ref>]
+codexswap import <path> [--force]
+codexswap purge [--yes]
+```
+
+Global flags: `--debug`, `--version`, `--no-color`, `--home PATH` (override
+`$CODEXSWAP_HOME`).
+
+`<ref>` resolves in this order: exact slot number, alias (case-insensitive), email
+(case-insensitive), unique email prefix. Ambiguity raises `UserError` listing the
+candidates.
+
+Behaviour notes:
+
+- `list` probes usage for every enabled account **in parallel** (thread pool, max 4
+  workers) unless `--no-probe`; cached snapshots newer than `probe.staleSeconds` are
+  reused. Probe failures degrade to the cached value with a `stale` marker and never
+  abort the command.
+- `add` reads the live `~/.codex/auth.json`, derives identity, and copies it into the
+  next free slot (or `--slot`). Re-adding an email that already exists updates that slot
+  in place instead of creating a duplicate.
+- `switch` with no `<ref>` and no `--strategy` rotates to the next slot. With
+  `--strategy` it uses `strategy.pick_target`. Before overwriting the live auth it
+  copies the live `auth.json` back into the slot it belongs to, so token refreshes done
+  by the live session are not lost.
+- `switch` refuses when a Codex process is running unless `--force`, printing the pids.
+- `run <ref> -- ...` runs `codex` with `CODEX_HOME` pointed at the slot home. It does
+  not touch the live auth, so it is safe alongside a different active account. With no
+  `<ref>` it uses the directory mapping for `os.getcwd()`.
+- `reset` with no subcommand lists credits for the active account.
+- `reset use` prompts for confirmation unless `--yes`; `--dry-run` shows what would be
+  redeemed and exits 0 without calling the backend.
+- `purge` requires `--yes` or an interactive `yes` answer; it deletes `<root>` entirely
+  and never touches `~/.codex`.
+
+Exit codes come from the exception table in section 4; success is 0.
+
+### JSON output
+
+`--json` emits a single JSON object to stdout and nothing else. Shapes:
+
+```json
+{"activeSlot":1,"accounts":[{"slot":1,"email":"a@example.com","alias":null,
+  "disabled":false,"planType":"pro","health":"ok",
+  "usage":{"bindingPercent":84.0,
+    "primary":{"usedPercent":84,"windowMinutes":10080,"resetsAt":1789435573},
+    "secondary":null,"resetCreditsAvailable":3,"fetchedAt":1789.0,"stale":false}}]}
+```
+
+```json
+{"activeSlot":1,"account":{"slot":1,"email":"a@example.com"}}
+```
+
+```json
+{"from":1,"to":2,"account":{"slot":2,"email":"b@example.com"}}
+```
+
+```json
+{"slot":1,"availableCount":3,"credits":[{"id":"RateLimitResetCredit_c527",
+  "status":"available","expiresAt":1789950028,"daysUntilExpiry":11.9,
+  "title":"Full reset"}]}
+```
+
+```json
+{"slot":1,"creditId":"RateLimitResetCredit_c527","outcome":"reset","dryRun":false}
+```
+
+---
+
+## 10. Rendering (`src/codexswap/render.py`)
+
+Plain ANSI, no dependencies. `list` output mirrors the cswap tree style:
+
+```
+Accounts:
+  1: a@example.com  [pro]  * active
+     |- 5h:   12%   resets 09-09 08:20   in 2h 7m
+     |- 7d:   84%   resets 09-15 10:26   in 6d 7h
+     +- resets: 3 available (soonest expires in 11d)
+
+  2: b@example.com  [plus]  disabled
+     re-login needed - refresh token expired; run: codexswap add
+```
+
+Use ASCII only (`|-`, `+-`) so Windows consoles in code page 949 do not mangle output.
+Colour is applied only when `supports_color()` is true: green under 50%, yellow 50-79%,
+red 80 and above.
+
+```python
+def supports_color(stream, setting: str) -> bool   # respects NO_COLOR and ui.color
+def human_duration(seconds: float) -> str          # "6d 7h", "2h 7m", "45s"
+def format_ts(ts: Optional[int]) -> str            # local time "09-15 10:26", "-" if None
+def render_accounts(...) -> str
+def render_status(...) -> str
+def render_reset_list(...) -> str
+def render_config(items) -> str
+```
+
+---
+
+## 11. Transfer format (`src/codexswap/transfer.py`)
+
+```json
+{
+  "format": "codexswap-export",
+  "version": 1,
+  "exportedAt": "2026-09-09T03:00:00Z",
+  "activeSlot": 1,
+  "accounts": [
+    {"slot":1,"email":"a@example.com","alias":"main","disabled":false,
+     "auth":{"auth_mode":"chatgpt","tokens":{}}}
+  ]
+}
+```
+
+`export(path, *, account_ref=None)` and `import_(path, *, force=False)`.
+Import refuses to overwrite an occupied slot unless `force`; on conflict without
+`force` it allocates the next free slot and reports the remap. A `version` other than
+1 raises `UserError`. The file is written `0o600` because it contains refresh tokens,
+and the CLI prints a warning saying so.
+
+---
+
+## 12. Testing requirements
+
+`pytest`, no network, no real Codex binary. Every test sets `CODEXSWAP_HOME` to a
+`tmp_path` via a fixture. Required coverage:
+
+- `identity`: JWT decode including padding edge cases, missing claims, apikey mode,
+  malformed base64 raising `AuthFileInvalid`.
+- `store`: add/remove/alias/enable/disable/swap/move, slot allocation, ref resolution
+  including ambiguity, round-trip through `accounts.json`, corrupt file recovery.
+- `settings`: defaults, validation bounds, bool parsing, unknown key errors, save/load.
+- `strategy`: both strategies, hysteresis, ties, unknown percent, all-ineligible.
+- `resets.decide`: one test per numbered rule in section 6.
+- `auto.tick`: every `TickResult.action` value, cooldown, unhealthy escalation, and a
+  dry-run test asserting that no mutating fake was called.
+- `transfer`: round-trip, slot conflict with and without `force`, version rejection.
+- `appserver`: framing and handshake against a fake subprocess (a small Python script
+  that speaks the protocol), timeout handling, malformed line skipping, error responses.
+- `render`: no ANSI when colour is disabled, duration and timestamp formatting.
+- `cli`: argument parsing for every subcommand, exit codes for each error class, and
+  `--json` shapes matching section 9.
+
+Target: the suite runs in under 30 seconds on Windows.

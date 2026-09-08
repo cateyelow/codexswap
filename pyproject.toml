@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codexswap"
+dynamic = ["version"]
+description = "Multi-account switcher and banked rate-limit reset manager for OpenAI Codex CLI"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+keywords = ["codex", "openai", "cli", "account", "switcher", "rate-limit"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+codexswap = "codexswap.cli:main"
+cxswap = "codexswap.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/cateyelow/codexswap"
+Issues = "https://github.com/cateyelow/codexswap/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.5"]
+
+[tool.hatch.version]
+path = "src/codexswap/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codexswap"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+# UP006/UP007/UP035: we deliberately keep typing.Optional / typing.List rather than
+# PEP 585 and PEP 604 syntax. Every module uses `from __future__ import annotations`,
+# so both forms are valid in annotations, but the typing.* spelling also stays correct
+# in the runtime-evaluated positions this codebase uses on Python 3.9.
+ignore = ["E501", "UP006", "UP007", "UP035"]
