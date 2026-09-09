@@ -215,8 +215,10 @@ def probe_usage(codex_home: Path, *, timeout: float = 20.0) -> UsageSnapshot:
 
     Callers must gate this behind the explicit opt-in; nothing here decides policy.
     `/wham/usage` is undocumented and its shape is unverified, so an unrecognised
-    payload yields unknown usage rather than invented numbers, and reset credits come
-    from the endpoint whose shape section 1.5 does record.
+    payload yields unknown usage rather than invented numbers. Reset credits are kept
+    when that response already carried a recognisable list, and otherwise fetched from
+    the dedicated endpoint whose shape section 1.5 does record; the second request is
+    made only when the first response supplied nothing.
     """
     auth = identity.load_auth(Path(codex_home) / "auth.json")
     tokens = auth.get("tokens")

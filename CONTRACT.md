@@ -36,8 +36,12 @@ the simplest behaviour consistent with the rest of the document and add a short
   no https-to-http downgrade. urllib copies `Authorization` onto redirects.
 - Files containing credentials are written with mode `0o600` on POSIX. On Windows,
   `os.chmod` is mostly a no-op; that is accepted, do not attempt ACL surgery.
-- All writes to shared state go through `paths.atomic_write_*` (temp file in the same
-  directory + `os.replace`) so a crash cannot truncate state.
+- Every write to a shared *document* goes through `paths.atomic_write_*` (temp file in
+  the same directory + `os.replace`) so a crash cannot truncate state: the registry,
+  settings, the usage cache, auto state, slot `auth.json` and `config.toml`. Two files
+  are deliberately written in place because they are not documents: the auto log is
+  appended line by line (and rewritten atomically only when it is trimmed), and the
+  lock file is opened and byte-locked, never rewritten.
 - **Fail closed on anything irreversible.** Losing the live credential and spending a
   reset credit cannot be undone, so when the program cannot establish that an action is
   safe it refuses instead of guessing:
@@ -147,7 +151,7 @@ Then request `{"id":2,"method":"account/rateLimits/read"}` (params must be omitt
       "credits":null,"planType":"pro"}},
   "rateLimitResetCredits":{
     "availableCount":3,
-    "credits":[{"id":"RateLimitResetCredit_c527...","resetType":"codexRateLimits",
+    "credits":[{"id":"RateLimitResetCredit_<opaque>","resetType":"codexRateLimits",
                 "status":"available","grantedAt":1787358028,"expiresAt":1789950028,
                 "title":"Full reset",
                 "description":"Thanks for using Codex! ..."}]},
@@ -189,13 +193,15 @@ the user passes `--backend`, or when the app-server path fails and
 `probe.allowBackendFallback` is true (default **false**). Every code path that uses
 them must be reachable only through those two switches.
 
-`backend.probe_usage(codex_home, *, timeout)` is the fallback that `cli._probe_all`
+`backend.probe_usage(codex_home, *, timeout: float = 20.0)` is the fallback that `cli._probe_all`
 calls after an app-server probe fails, and only under one of those two switches. It
 reads the slot's own `auth.json` for the access token and account id. `/wham/usage`
 is undocumented and its shape unverified, so an unrecognised payload yields **unknown
-usage** rather than invented numbers, and reset credits come from the endpoint whose
-shape this section does record. `backend.consume_reset_credit` accepts only the four
-documented outcomes, as `appserver` does.
+usage** rather than invented numbers. Reset credits are kept when the usage response
+already carried a list this code recognises; only when it did not does a second
+request go to `/wham/rate-limit-reset-credits`, whose shape this section does record.
+`backend.consume_reset_credit` accepts only the four documented outcomes, as
+`appserver` does.
 
 ---
 
@@ -363,7 +369,8 @@ generic fault. Generic JSON-RPC codes (-32000 and below) are deliberately exclud
 Overwriting `auth.json` with something unusable logs the user out of Codex, and the
 original is gone. Three rules keep that from happening:
 
-- `identity.validate_auth(auth, *, source)` raises `errors.AuthFileInvalid` unless the
+- `identity.validate_auth(auth, *, source="authentication data")` raises
+  `errors.AuthFileInvalid` unless the
   object carries something Codex can actually authenticate with: `tokens.refresh_token`
   or `tokens.access_token` as a non-empty string, or a non-empty `OPENAI_API_KEY`.
   `identity.load_auth` only proves the file holds a JSON object, which `{}` and
@@ -419,8 +426,12 @@ label that can be wrong: a hand-copied `auth.json`, a restored backup, or a logi
 performed directly into a slot home all leave the label pointing at someone else.
 
 `UsageSnapshot.describes(identity)` compares the probed `accountId` with the
-identity derived from the slot's `auth.json`. It is false only when both are known
-and differ, so API-key accounts and older caches that predate the field still match.
+identity the **registry** records for that slot. The probe reads the slot's
+`auth.json`, so a disagreement means the registry label and the stored credential
+have come apart, which is the thing worth catching. It is false only when both ids
+are known and differ, so API-key accounts and caches predating the field still match.
+`doctor`'s `slot.N.identity` check compares the same two things directly, without a
+probe, and is what the refusals below tell the user to run.
 
 Every place a reading is bound to a slot enforces it:
 
@@ -476,7 +487,7 @@ are non-default. `config` prints `key  value  (default)` aligned.
 | `autoswitch.hysteresisPct` | int | `10` | 0..50 |
 | `autoswitch.strategy` | str | `best` | `best` or `next-available` |
 | `autoswitch.unhealthyTicks` | int | `3` | 1..20 |
-| `autoswitch.model` | str | `` | any comma separated list |
+| `autoswitch.model` | str | `""` | any comma separated list |
 | `reset.policy` | str | `expiring` | `never`, `expiring`, `exhausted`, `always` |
 | `reset.expiryDays` | int | `3` | 0..30 |
 | `reset.minUsagePercent` | int | `50` | 0..100 |
@@ -719,6 +730,7 @@ accounts that both hover at the threshold.
 class Candidate:
     account: Account
     snapshot: Optional[UsageSnapshot]
+    models: Tuple[str, ...] = ()   # per-model limits to weigh; see percent_for
     @property
     def percent(self) -> Optional[float]
 
@@ -791,6 +803,7 @@ codexswap unmap [path]
 codexswap probe [<ref>] [--backend] [--json]
 codexswap reset [list] [--json]
 codexswap reset use [<ref>] [--credit ID] [--yes] [--dry-run]
+codexswap reset --json use ...            (--json belongs to the reset parser)
 codexswap auto [--once] [--dry-run] [--interval N] [--threshold N] [--model NAMES]
 codexswap config [set <KEY> <VALUE> | unset <KEY>] [--json]
 codexswap export <path> [--account <ref>]
@@ -799,7 +812,8 @@ codexswap purge [--yes]
 ```
 
 Global flags: `--debug`, `--version`, `--no-color`, `--home PATH` (override
-`$CODEXSWAP_HOME`).
+`$CODEXSWAP_HOME`). argparse also installs `-h`/`--help` on the root parser and on
+every subcommand.
 
 `<ref>` resolves in this order: exact slot number, alias (case-insensitive), email
 (case-insensitive), unique email prefix. Ambiguity raises `UserError` listing the
@@ -853,7 +867,8 @@ Exit codes come from the exception table in section 4; success is 0.
   `UserError` (2). With a ref it processes that slot; otherwise all slots, including
   disabled ones, in numeric order. It reports one line per slot: `copied`,
   `unchanged (already identical)`, `skipped (different config.toml; use --force to
-  overwrite)`, `overwritten`, or `failed (cannot read or write config.toml)`.
+  overwrite)`, `overwritten`, `failed (cannot read or write config.toml)`, or
+  `failed (slot home is not inside the homes directory)`.
   Different configs require `--force`; identical configs are not rewritten even
   with force. Other slots still run after a destination error. Any skip/failure
   returns 1; complete success (including no slots with a readable source) returns 0.
@@ -872,10 +887,12 @@ Exit codes come from the exception table in section 4; success is 0.
   `CODEX_HOME`. The only app-server exchange is `initialize`/`initialized`;
   no usage read, backend call, or credit consumption is permitted.
   Diagnostics do not quarantine corrupt files or create missing homes/locks.
-  Missing homes/auth, no accounts, unknown setting keys, non-private POSIX modes,
-  a busy lock, running sessions, or less than 100 MiB free are warnings. Invalid
-  registry/settings/auth, unwritable homes, unavailable Codex/handshake, or disk
-  inspection failure are failures. Missing settings use defaults. Process discovery
+  A missing live auth file, no accounts, unknown setting keys, non-private POSIX
+  modes, a busy lock, running sessions, a slot credential with no identity to compare,
+  a missing home, or less than 100 MiB free are warnings. A **missing or unreadable
+  slot** auth file is a failure, not a warning: the slot cannot be switched to.
+  Invalid registry/settings/auth, a slot holding another account, unwritable homes,
+  unavailable Codex/handshake, or disk inspection failure are also failures. Missing settings use defaults. Process discovery
   is best effort and reports PIDs only, never command lines. Known credentials and
   recognised token patterns are redacted from output. Exit 1 if any check fails,
   otherwise 0. JSON emits exactly one object, even for failed checks.
@@ -887,9 +904,12 @@ Exit codes come from the exception table in section 4; success is 0.
   Failed refreshes are retried next frame without exposing exception text.
   Ctrl+C prints a final newline and exits 0. No curses dependency.
 - `upgrade` detects uv tool/pipx venv paths using `sys.prefix`, `sys.argv[0]`, and
-  package location; otherwise a package in this interpreter's site/dist-packages
-  identifies plain pip. Editable/source checkouts or conflicting evidence are
-  ambiguous. Commands are `uv tool upgrade codexswap`, `pipx upgrade codexswap`,
+  package location. That evidence decides on its own, including for an editable
+  install inside such a venv, because the manager that owns the venv is still the one
+  that can upgrade it. Only when there is no uv or pipx evidence does an installed
+  package under this interpreter's site/dist-packages identify plain pip. A plain
+  source checkout, and uv and pipx evidence together, are ambiguous.
+  Commands are `uv tool upgrade codexswap`, `pipx upgrade codexswap`,
   or `<sys.executable> -m pip install --upgrade codexswap`. The exact quoted command
   prints before confirmation. Only `--yes`, `y`, or `yes` permits execution;
   EOF/other answers cancel with exit 0. Unknown method lists all three candidates,
@@ -901,7 +921,10 @@ Exit codes come from the exception table in section 4; success is 0.
 
 ### JSON output
 
-`--json` emits a single JSON object to stdout and nothing else. Shapes:
+On success, `--json` emits a single JSON object to stdout and nothing else. There is
+no JSON error envelope: an expected failure prints `error: ...` to stderr, leaves
+stdout empty, and returns the exit code from section 4. Warnings also go to stderr,
+so stdout stays parseable. Shapes:
 
 ```json
 {"activeSlot":1,"accounts":[{"slot":1,"email":"a@example.com","alias":null,
@@ -911,8 +934,13 @@ Exit codes come from the exception table in section 4; success is 0.
     "secondary":null,"resetCreditsAvailable":3,"fetchedAt":1789.0,"stale":false}}]}
 ```
 
+`status --json`, and `probe <ref> --json`, wrap one **full** account entry, the same
+object `list` puts in its array, under `account`. `probe` with no `<ref>` uses the
+`accounts` array shape instead, because it probes every enabled account:
+
 ```json
-{"activeSlot":1,"account":{"slot":1,"email":"a@example.com"}}
+{"activeSlot":1,"account":{"slot":1,"email":"a@example.com","alias":null,
+  "disabled":false,"planType":"pro","health":"ok","usage":null}}
 ```
 
 ```json
@@ -920,13 +948,29 @@ Exit codes come from the exception table in section 4; success is 0.
 ```
 
 ```json
-{"slot":1,"availableCount":3,"credits":[{"id":"RateLimitResetCredit_c527",
+{"slot":1,"availableCount":3,"credits":[{"id":"RateLimitResetCredit_example",
   "status":"available","expiresAt":1789950028,"daysUntilExpiry":11.9,
   "title":"Full reset"}]}
 ```
 
+`credits` lists every credit the account holds, redeemed and expired ones included, so
+a client can show history. `availableCount` counts only those still redeemable, and is
+the number the text listing and the auto policy use. Credit identifiers in this
+document are synthetic; a real one is an opaque handle to a specific account's credit.
+
 ```json
-{"slot":1,"creditId":"RateLimitResetCredit_c527","outcome":"reset","dryRun":false}
+{"slot":1,"creditId":"RateLimitResetCredit_example","outcome":"reset","dryRun":false}
+```
+
+`outcome` is `null` for a preview (`"dryRun":true`) and for a redemption the user
+declined at the prompt (`"dryRun":false`), so the two are told apart by `dryRun`.
+
+`config --json` is a flat object of all 16 dotted keys mapped to their effective
+typed values, after any `set`/`unset` in the same invocation. It carries no nesting
+and no default/override marker; `config` without `--json` prints that marker.
+
+```json
+{"autoswitch.enabled":true,"autoswitch.threshold":80,"reset.policy":"expiring"}
 ```
 
 ---
@@ -943,16 +987,22 @@ Accounts:
      +- resets: 3 available (soonest expires in 11d)
 
   2: b@example.com  [plus]  disabled
-     re-login needed - refresh token expired; run: codexswap add
+     re-login needed - authentication was rejected; run: codexswap add
 ```
+
+The banner's reason is `authentication was rejected` when the credential was refused
+and `stored credential could not be read` when the slot's `auth.json` is unusable. An
+expired billing period inside a still-valid token earns no banner at all.
 
 Use ASCII only (`|-`, `+-`) so Windows consoles in code page 949 do not mangle output.
 Colour is applied only when `supports_color()` is true: green under 50%, yellow 50-79%,
-red 80 and above.
+red 80 and above. `ui.color` is checked first and settles the question on its own:
+`never` and `always` both win outright, so `always` emits colour even under `NO_COLOR`
+or a redirected stdout. Only `auto` consults `NO_COLOR`, `TERM=dumb` and `isatty()`.
 
 ```python
-def supports_color(stream, setting: str) -> bool   # respects NO_COLOR and ui.color
-def human_duration(seconds: float) -> str          # "6d 7h", "2h 7m", "45s"
+def supports_color(stream, setting: str) -> bool   # ui.color first, then NO_COLOR/tty
+def human_duration(seconds: Optional[float]) -> str  # "6d 7h", "45s"; None is "-"
 def format_ts(ts: Optional[int]) -> str            # local time "09-15 10:26", "-" if None
 def render_accounts(...) -> str
 def render_status(...) -> str
@@ -977,7 +1027,10 @@ def render_config(items) -> str
 }
 ```
 
-`export(path, *, account_ref=None)` and `import_(path, *, force=False)`.
+`transfer.export_accounts(store, path, *, account_ref=None) -> int` and
+`transfer.import_accounts(store, path, *, force=False) -> List[Tuple[int, int]]`.
+Export skips an account whose slot `auth.json` is missing or unreadable, warning on
+stderr, so selecting exactly one such account writes an archive with no accounts.
 Import refuses to overwrite an occupied slot unless `force`; on conflict without
 `force` it allocates the next free slot and reports the remap. A `version` other than
 1 raises `UserError`. The file is written `0o600` because it contains refresh tokens,

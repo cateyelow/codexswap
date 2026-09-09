@@ -9,7 +9,7 @@ a banked credit when it is useful, while guarding against wasting one on a light
 used account. It works on Windows, macOS, and Linux.
 
 [![Python 3.9–3.13](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/cateyelow/codexswap/blob/main/pyproject.toml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/cateyelow/codexswap/blob/main/LICENSE)
 [![CI](https://github.com/cateyelow/codexswap/actions/workflows/ci.yml/badge.svg)](https://github.com/cateyelow/codexswap/actions/workflows/ci.yml)
 
 ## Install
@@ -45,6 +45,11 @@ uv tool install .          # Or: pip install -e ".[dev]" for a development check
 Use the normal Codex home (`~/.codex`) for these logins. During the second login,
 choose the other account in the browser.
 
+The last command runs in the foreground until you press Ctrl+C, and its default
+policy **may spend a reset credit** that is close to expiring. Redemption cannot be
+undone. To keep it manual, run `codexswap config set reset.policy never` first, and
+read [Reset credits](#reset-credits) before leaving `auto` running.
+
 ```sh
 codex login                      # Sign in to your first Codex account.
 codexswap add --alias personal    # Save its credentials in a local slot.
@@ -53,9 +58,6 @@ codexswap add --alias work        # Save the second account in another slot.
 codexswap list                    # Show saved accounts, usage, and reset credits.
 codexswap auto                    # Monitor usage and apply switching/reset policy.
 ```
-
-`auto` runs in the foreground until you press Ctrl+C. The default policy may redeem
-an expiring credit; read [Reset credits](#reset-credits) before leaving it running.
 
 ## How it works
 
@@ -298,9 +300,13 @@ codexswap auto --once --dry-run
 ```
 
 Dry runs perform reads and decisions, but neither switch accounts nor redeem
-credits, and they write nothing at all: not `state.json`, not the account registry,
-not the usage cache, and not the log. A preview that cached what it read would let
-the next real tick skip its own probe, so each dry tick probes afresh.
+credits, and codexswap writes nothing at all: not `state.json`, not the account
+registry, not the usage cache, and not the log. A preview that cached what it read
+would let the next real tick skip its own probe, so each dry tick probes afresh.
+
+A dry run still *reads* usage, which means starting Codex against each slot home.
+Codex may update its own state or refresh a credential there; that is Codex writing
+in its own home, not codexswap recording a decision.
 
 A running `codexswap auto` re-reads its settings every tick, so `codexswap config set`
 takes effect without restarting it. Values passed as `--interval`, `--threshold`, or
@@ -395,7 +401,7 @@ codexswap config unset autoswitch.threshold
 | `autoswitch.hysteresisPct` | int | `10` | 0..50 | Percentage points below threshold required for a target with known usage. |
 | `autoswitch.strategy` | str | `best` | `best`, `next-available` | Choose the least-used eligible account or the next eligible slot. |
 | `autoswitch.unhealthyTicks` | int | `3` | 1..20 | Consecutive active-account probe failures before trying another account. |
-| `autoswitch.model` | str | `` | any comma separated list | Per-model limits to weigh alongside the totals; `all` selects every reported model. |
+| `autoswitch.model` | str | `""` | any comma separated list | Per-model limits to weigh alongside the totals; `all` selects every reported model. |
 | `reset.policy` | str | `expiring` | `never`, `expiring`, `exhausted`, `always` | Decide when auto mode may spend a banked reset. |
 | `reset.expiryDays` | int | `3` | 0..30 | Expiry horizon in days for the `expiring` policy. |
 | `reset.minUsagePercent` | int | `50` | 0..100 | Minimum binding usage for any policy-driven redemption. |
@@ -403,7 +409,7 @@ codexswap config unset autoswitch.threshold
 | `probe.timeoutSeconds` | int | `45` | 5..300 | Time allowed for a Codex app-server probe. |
 | `probe.staleSeconds` | int | `120` | 0..86400 | Maximum age of cached usage reused without a fresh probe. |
 | `probe.allowBackendFallback` | bool | `false` | `true`, `false` | Opt in to unsupported backend calls when the app-server path fails. |
-| `ui.color` | str | `auto` | `auto`, `always`, `never` | Select terminal colour behaviour; `NO_COLOR` is respected. |
+| `ui.color` | str | `auto` | `auto`, `always`, `never` | Select terminal colour behaviour. `auto` respects `NO_COLOR` and whether stdout is a terminal; `always` and `never` override both. |
 
 Boolean values also accept `1`/`0`, `yes`/`no`, and `on`/`off`, case-insensitively.
 Unknown keys and values outside the allowed choices or bounds are rejected.
@@ -547,8 +553,9 @@ import seeds a missing config from the destination machine's live Codex home.
   that account's quota. Concurrent token refreshes can invalidate a refresh token
   stored on the other machine. Re-login and re-add the account on the affected
   machine; copying an older auth file cannot restore an invalidated token.
-- **Usage is marked `stale`, or auto mode finds no target:** Stale usage means a
-  probe failed and cached data is being shown. Check `CODEX_BIN`, connectivity,
+- **Usage is marked `stale`, or auto mode finds no target:** Stale usage means the
+  number on screen came from the cache and is older than `probe.staleSeconds`, either
+  because a probe failed or because nothing has probed that account recently. Check `CODEX_BIN`, connectivity,
   and login health. For selection, check enabled accounts and hysteresis: with
   defaults, a known-usage target must be at or below 70%, not merely below 80%.
 - **No usage appears for an API-key account:** API-key accounts are supported,
@@ -564,12 +571,12 @@ import seeds a missing config from the destination machine's live Codex home.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and checks.
-[CONTRACT.md](CONTRACT.md) is the specification; behaviour changes must update it
+See [CONTRIBUTING.md](https://github.com/cateyelow/codexswap/blob/main/CONTRIBUTING.md) for development setup and checks. Behaviour changes are recorded in [CHANGELOG.md](https://github.com/cateyelow/codexswap/blob/main/CHANGELOG.md).
+[CONTRACT.md](https://github.com/cateyelow/codexswap/blob/main/CONTRACT.md) is the specification; behaviour changes must update it
 in the same commit. Report reproducible problems through the
 [issue tracker](https://github.com/cateyelow/codexswap/issues), without credentials
 or unredacted email addresses.
 
 ## License (MIT)
 
-Released under the [MIT License](LICENSE).
+Released under the [MIT License](https://github.com/cateyelow/codexswap/blob/main/LICENSE).
