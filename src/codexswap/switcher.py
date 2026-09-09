@@ -265,6 +265,41 @@ def capture_current(
         return account
 
 
+def _slot_holding_api_key(store: AccountStore, key: Optional[str]):
+    """The slot whose stored auth is exactly this API key, if any. Caller holds the lock."""
+    if not isinstance(key, str) or not key:
+        return None
+    for account in store.ordered():
+        if account.identity.auth_mode != "apikey":
+            continue
+        with suppress(errors.AuthFileMissing, errors.AuthFileInvalid, OSError, ValueError):
+            stored = identity.load_auth(store.path_for(paths.slot_auth_path(account.slot)))
+            if stored.get("OPENAI_API_KEY") == key:
+                return account
+    return None
+
+
+def live_credential_is_registered(store: AccountStore) -> bool:
+    """Whether the live auth file belongs to an account this store knows.
+
+    `activate` overwrites the live file, so a credential no account owns is destroyed
+    by the switch. A `codex login` that was never followed by `codexswap add` is
+    exactly that case, and it is the one where the user has no other copy.
+    """
+    try:
+        auth = identity.load_auth(paths.live_auth_path())
+        identity.validate_auth(auth)
+    except (OSError, ValueError, errors.AuthFileMissing, errors.AuthFileInvalid):
+        # Nothing usable is there, so nothing usable can be lost.
+        return True
+    derived = identity.identity_from_auth(auth)
+    if derived.account_id is not None and store.find_by_account_id(derived.account_id):
+        return True
+    if derived.email is not None and store.find_by_email(derived.email):
+        return True
+    return _slot_holding_api_key(store, auth.get("OPENAI_API_KEY")) is not None
+
+
 def sync_live_to_slot(store: AccountStore) -> Optional[int]:
     if not paths.live_auth_path().exists():
         return None
@@ -287,6 +322,10 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
                    if derived.account_id is not None else None)
         if account is None and derived.email is not None:
             account = store.find_by_email(derived.email)
+        if account is None and derived.auth_mode == "apikey":
+            # An API key carries no account id and no email of its own, so the key
+            # itself is the only thing that identifies it.
+            account = _slot_holding_api_key(store, auth.get("OPENAI_API_KEY"))
         if account is None:
             return None
         slot_auth = store.path_for(paths.slot_auth_path(account.slot))
@@ -321,6 +360,11 @@ def activate(
             raise errors.CodexRunning(f"{describe_running(processes)}. Close them or pass --force")
     with FileLock(store.path_for(paths.lock_path())):
         store.reload()
+        if not force and not live_credential_is_registered(store):
+            raise errors.UserError(
+                "The live Codex login belongs to no registered account, and switching "
+                "would overwrite it. Run codexswap add to keep it, or pass --force"
+            )
         target = store.get(target.slot)
         auth_path = store.path_for(paths.slot_auth_path(target.slot))
         if not auth_path.is_file():

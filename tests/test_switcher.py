@@ -215,3 +215,58 @@ def test_a_listing_with_no_codex_rows_still_reports_empty(monkeypatch):
     monkeypatch.setattr(switcher.subprocess, "run", lambda *a, **k: Completed(next(outputs)))
 
     assert switcher.detect_running_codex() == []
+
+
+def _two_accounts() -> AccountStore:
+    store = AccountStore.load()
+    for slot, email in ((1, "one@example.com"), (2, "two@example.com")):
+        store.add_from_auth(make_auth(email=email, account_id=f"acct-{slot}"))
+    store.set_active(1)
+    return store
+
+
+def test_switching_refuses_to_overwrite_an_unregistered_live_login(codex_root, monkeypatch):
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    # Someone ran `codex login` for a third account and never ran `codexswap add`.
+    paths.atomic_write_json(paths.live_auth_path(), make_auth(
+        email="stranger@example.com", account_id="acct-stranger"))
+    before = paths.live_auth_path().read_bytes()
+
+    with pytest.raises(errors.UserError, match="belongs to no registered account"):
+        switcher.activate(store, store.get(2))
+
+    assert paths.live_auth_path().read_bytes() == before
+    assert AccountStore.load().active_slot != 2
+
+
+def test_force_still_switches_over_an_unregistered_live_login(codex_root):
+    store = _two_accounts()
+    paths.atomic_write_json(paths.live_auth_path(), make_auth(
+        email="stranger@example.com", account_id="acct-stranger"))
+
+    switcher.activate(store, store.get(2), force=True)
+
+    assert AccountStore.load().active_slot == 2
+
+
+def test_an_unusable_live_file_does_not_block_a_switch(codex_root, monkeypatch):
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    # There is nothing to lose, so refusing here would only be in the way.
+    paths.atomic_write_json(paths.live_auth_path(), {"tokens": {}})
+
+    switcher.activate(store, store.get(2))
+
+    assert AccountStore.load().active_slot == 2
+
+
+def test_an_absent_live_file_does_not_block_a_switch(codex_root, monkeypatch):
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    if paths.live_auth_path().exists():
+        paths.live_auth_path().unlink()
+
+    switcher.activate(store, store.get(2))
+
+    assert AccountStore.load().active_slot == 2
