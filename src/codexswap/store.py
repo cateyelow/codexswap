@@ -232,8 +232,10 @@ class AccountStore:
             self.reload()
             accounts = [self.resolve(ref)] if ref is not None else self.ordered()
             for account in accounts:
-                destination = self._checked_home(account.slot) / "config.toml"
                 try:
+                    # A slot home that escaped the registry is refused, but that is
+                    # this slot's problem alone; the rest still get their config.
+                    destination = self._checked_home(account.slot) / "config.toml"
                     present = destination.exists() or destination.is_symlink()
                     if present and destination.read_bytes() == raw:
                         action = "unchanged (already identical)"
@@ -242,6 +244,8 @@ class AccountStore:
                     else:
                         paths.atomic_write_text(destination, content, mode=0o600)
                         action = "overwritten" if present else "copied"
+                except errors.UserError:
+                    action = "failed (slot home is not inside the homes directory)"
                 except OSError:
                     # A bad destination must not prevent reporting the other slots.
                     action = "failed (cannot read or write config.toml)"

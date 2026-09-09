@@ -94,6 +94,26 @@ def test_sync_all_conflicts_and_force(codex_root, capsys):
     assert config.read_text() == "# live\n"
 
 
+def test_sync_reports_an_escaped_slot_home_and_keeps_going(monkeypatch, codex_root, capsys):
+    """One tampered slot home must not cost the other slots their config."""
+    store = AccountStore.load()
+    store.add_from_auth(make_auth())
+    store.add_from_auth(make_auth(email="second@example.com", account_id="second"))
+    (codex_root / "config.toml").write_text("# live\n")
+    original = AccountStore._checked_home
+
+    def refuse(self, slot):
+        if slot == 1:
+            raise errors.UserError("Slot home must be inside the homes directory")
+        return original(self, slot)
+
+    monkeypatch.setattr(AccountStore, "_checked_home", refuse)
+    assert cli.main(["sync-config"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "slot 1: failed (slot home is not inside the homes directory)", "slot 2: copied"]
+    assert (paths.slot_home(2) / "config.toml").read_text() == "# live\n"
+
+
 @pytest.mark.parametrize("use_directory", [False, True])
 def test_sync_from_file_or_directory_one_alias(tmp_path, capsys, use_directory):
     store = AccountStore.load()
