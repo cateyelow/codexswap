@@ -17,10 +17,13 @@ First public release.
   policy. **Redeeming a reset credit cannot be undone.** The default policy spends a
   credit that is close to expiring; `reset.policy never` keeps redemption manual.
 - Fail-closed rules for everything irreversible: credentials are validated before any
-  write, unreadable settings or state refuse to authorise a redemption, failed process
-  discovery blocks a switch, a slot whose credential belongs to another account is
-  refused rather than read, a live login no account owns is not overwritten without
-  `--force`, and the slot's account is re-checked in the moment before a credit is
-  spent.
+  write, unreadable settings or a lost redemption history refuse to authorise a
+  redemption, failed process discovery blocks a switch, a slot whose credential
+  belongs to another account is refused rather than read, and the slot's account is
+  re-checked in the moment before a credit is spent.
+- A switch never destroys a login nothing else holds. A live `auth.json` that no slot
+  has a copy of is put in `<root>/unclaimed/` first, and `codexswap unclaimed` lists,
+  registers (`--claim`) or drops (`--purge`) what was rescued. `doctor` reports any
+  that are still waiting.
 - Runs on Windows, macOS and Linux, Python 3.9+, standard library only at runtime.
   Codex itself is installed separately.

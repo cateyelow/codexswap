@@ -72,6 +72,10 @@ class AutoState:
     # history we failed to read look identical otherwise, and the second must never
     # be allowed to authorise a redemption. Not serialised: it describes this read.
     unreadable: bool = field(default=False, compare=False)
+    # When the history was first found unreadable. This one IS serialised, because
+    # the very next save would otherwise replace the unreadable document with a valid
+    # empty one and hand the daily cap straight back.
+    history_unknown_since: Optional[float] = field(default=None, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +85,19 @@ class AutoState:
             "redemptions": [dict(entry) for entry in self.redemptions],
         }
 
+    def history_is_unknown(self, now: float) -> bool:
+        """Whether entries the daily cap would have counted are missing.
+
+        A document that would not parse took its history with it. That matters for
+        exactly as long as the cap's own window: once 24 hours have passed, no lost
+        entry could still count against it, so the daemon stops refusing over it
+        instead of staying stuck until someone notices.
+        """
+        if self.unreadable:
+            return True
+        since = self.history_unknown_since
+        return since is not None and now - since < _DAY
+
     @classmethod
     def from_dict(cls, d: Any) -> AutoState:
         if not isinstance(d, dict):
@@ -88,6 +105,7 @@ class AutoState:
         state = cls(
             last_switch_at=_timestamp(d.get("lastSwitchAt")),
             cooldown_until=_timestamp(d.get("cooldownUntil")),
+            history_unknown_since=_timestamp(d.get("historyUnknownSince")),
         )
         unhealthy = d.get("unhealthy")
         if isinstance(unhealthy, dict):
@@ -111,9 +129,13 @@ class AutoState:
         destination = Path(root) / "state.json" if root is not None else paths.state_path()
         missing = object()
         data = paths.read_json_tolerant(destination, missing)
-        if data is missing:
+        # A document of the wrong shape is as unreadable as one that will not parse:
+        # both mean the history this file was supposed to hold is gone.
+        if data is missing or not isinstance(data, dict):
             state = cls()
             state.unreadable = destination.exists()
+            if state.unreadable:
+                state.history_unknown_since = time.time()
             return state
         return cls.from_dict(data)
 
@@ -124,10 +146,18 @@ class AutoState:
             # Every other field belongs to this process, but the redemption history is
             # a shared ledger of irreversible acts. Writing our copy over it would
             # erase another daemon's spend and hand back its share of the daily cap.
+            stored = AutoState.load(root)
             document = self.to_dict()
-            document["redemptions"] = _merge_history(
-                AutoState.load(root).redemptions, self.redemptions,
-            )
+            document["redemptions"] = _merge_history(stored.redemptions, self.redemptions)
+            # Carry the unknown-history marker into the document that replaces the
+            # unreadable one. The latest of the two stamps wins: it is the one whose
+            # lost entries could still be inside the cap window.
+            stamps = [value for value in (self.history_unknown_since,
+                                          stored.history_unknown_since)
+                      if value is not None]
+            if stamps and time.time() - max(stamps) < _DAY:
+                document["historyUnknownSince"] = max(stamps)
+                self.history_unknown_since = max(stamps)
             paths.atomic_write_json(destination, document, mode=0o600, indent=2)
 
     def redeemed_last_24h(self, now: float) -> int:
@@ -192,10 +222,10 @@ class RedemptionJournal:
             self.state.redemptions.append(entry)
             return True
         with self._lock():
-            if AutoState.load(self.root).unreadable:
+            if AutoState.load(self.root).history_is_unknown(now):
                 # A history we cannot read is not an empty history. Spending against
                 # it would be spending against a cap whose usage is unknown.
-                _logger.warning("state.json is unreadable; refusing to redeem")
+                _logger.warning("the redemption history is unknown; refusing to redeem")
                 return False
             self._adopt_other_processes()
             if cap > 0 and self.state.redeemed_last_24h(now) >= cap:

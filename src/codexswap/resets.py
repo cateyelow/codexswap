@@ -77,6 +77,11 @@ def redeem(
     directory anything can write to in between. `expect_account_id` is the account
     the decision was made about; if the credential in the home now belongs to
     somebody else, the credit would come out of their balance.
+
+    A credential that no longer says which account it is stops the redemption too.
+    The caller only supplies `expect_account_id` when the reading it decided on named
+    an account, so "the slot cannot tell me" here means the slot changed, and the
+    credit is irreversible either way.
     """
     if client_factory is None:
         from .appserver import AppServerClient
@@ -90,7 +95,13 @@ def redeem(
         found = identity.identity_from_auth(
             identity.load_auth(Path(codex_home) / "auth.json")
         ).account_id
-        if found and found != expect_account_id:
+        if not found:
+            raise errors.UserError(
+                "The credential in this slot no longer names an account; refusing to "
+                "redeem a credit that cannot be attributed to the account it was "
+                "chosen for"
+            )
+        if found != expect_account_id:
             raise errors.UserError(
                 "The credential in this slot changed while the decision was being "
                 "made; refusing to redeem against a different account"

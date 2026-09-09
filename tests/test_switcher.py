@@ -5,7 +5,7 @@ import json
 import pytest
 from conftest import make_auth
 
-from codexswap import appserver, errors, identity, paths, switcher
+from codexswap import appserver, errors, identity, paths, switcher, unclaimed
 from codexswap.store import AccountStore
 
 NOW = 1_788_912_000.0
@@ -225,29 +225,134 @@ def _two_accounts() -> AccountStore:
     return store
 
 
-def test_switching_refuses_to_overwrite_an_unregistered_live_login(codex_root, monkeypatch):
+def test_switching_rescues_an_unregistered_live_login_before_overwriting_it(
+    codex_root, monkeypatch,
+):
+    """A `codex login` nobody ran `add` on is the case with no second copy."""
     monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
     store = _two_accounts()
-    # Someone ran `codex login` for a third account and never ran `codexswap add`.
-    paths.atomic_write_json(paths.live_auth_path(), make_auth(
-        email="stranger@example.com", account_id="acct-stranger"))
-    before = paths.live_auth_path().read_bytes()
+    stranger = make_auth(email="stranger@example.com", account_id="acct-stranger")
+    paths.atomic_write_json(paths.live_auth_path(), stranger)
 
-    with pytest.raises(errors.UserError, match="belongs to no registered account"):
-        switcher.activate(store, store.get(2))
+    rescued = switcher.activate(store, store.get(2))
 
-    assert paths.live_auth_path().read_bytes() == before
-    assert AccountStore.load().active_slot != 2
+    assert rescued
+    assert AccountStore.load().active_slot == 2
+    assert unclaimed.credential(rescued) == stranger
+    assert unclaimed.resolve(rescued).email == "stranger@example.com"
 
 
-def test_force_still_switches_over_an_unregistered_live_login(codex_root):
+def test_force_rescues_too(codex_root):
+    """--force is about a running Codex, not about discarding someone's login."""
     store = _two_accounts()
-    paths.atomic_write_json(paths.live_auth_path(), make_auth(
-        email="stranger@example.com", account_id="acct-stranger"))
+    stranger = make_auth(email="stranger@example.com", account_id="acct-stranger")
+    paths.atomic_write_json(paths.live_auth_path(), stranger)
+
+    rescued = switcher.activate(store, store.get(2), force=True)
+
+    assert AccountStore.load().active_slot == 2
+    assert unclaimed.credential(rescued) == stranger
+
+
+def test_a_registered_live_login_is_not_stashed(codex_root, monkeypatch):
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    paths.atomic_write_json(paths.live_auth_path(),
+                            make_auth(email="one@example.com", account_id="acct-1"))
+
+    assert switcher.activate(store, store.get(2)) is None
+    assert unclaimed.entries() == []
+
+
+def test_a_shared_email_does_not_make_another_account_the_owner(codex_root, monkeypatch):
+    """An email is a label; the account id is the identity."""
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    # Same address, different account. Slot 1 is not a copy of this.
+    stranger = make_auth(email="one@example.com", account_id="acct-stranger")
+    paths.atomic_write_json(paths.live_auth_path(), stranger)
+
+    rescued = switcher.activate(store, store.get(2))
+
+    assert rescued
+    assert unclaimed.credential(rescued)["tokens"]["account_id"] == "acct-stranger"
+
+
+def test_an_api_key_label_cannot_stand_in_for_an_oauth_login(codex_root, monkeypatch):
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="one@example.com", account_id="acct-1"))
+    store.add_token("sk-service-key", email="shared@example.com")
+    store.set_active(1)
+    stranger = make_auth(email="shared@example.com", account_id="acct-stranger")
+    paths.atomic_write_json(paths.live_auth_path(), stranger)
+
+    rescued = switcher.activate(store, store.get(2), force=True)
+
+    assert unclaimed.credential(rescued) == stranger
+
+
+def test_a_credential_with_no_identity_is_recognised_by_its_own_bytes(
+    codex_root, monkeypatch,
+):
+    """Identical bytes are the only handle a credential with no id and no email has."""
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    faceless = {"auth_mode": "chatgpt", "tokens": {"refresh_token": "rt.faceless"}}
+    paths.atomic_write_json(store.path_for(paths.slot_auth_path(1)), faceless)
+    paths.atomic_write_json(paths.live_auth_path(), faceless)
+
+    assert switcher.activate(store, store.get(2)) is None
+    assert unclaimed.entries() == []
+
+
+def test_stale_registry_metadata_does_not_hide_a_saved_api_key(codex_root, monkeypatch):
+    """The slot's file is what would survive the switch, so the file decides."""
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    key_auth = {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-already-saved", "tokens": None}
+    # Slot 1 now holds an API key while the registry still records OAuth.
+    paths.atomic_write_json(store.path_for(paths.slot_auth_path(1)), key_auth)
+    paths.atomic_write_json(paths.live_auth_path(), dict(key_auth, last_refresh="later"))
+
+    assert switcher.activate(store, store.get(2)) is None
+    assert unclaimed.entries() == []
+
+
+def test_an_unparseable_live_file_is_kept_rather_than_assumed_worthless(
+    codex_root, monkeypatch,
+):
+    """Half-written and not-understood look the same from here; only one is junk."""
+    monkeypatch.setattr(switcher, "detect_running_codex", lambda: [])
+    store = _two_accounts()
+    paths.live_auth_path().write_text('{"tokens": {"refresh_to', encoding="utf-8")
+
+    rescued = switcher.activate(store, store.get(2))
+
+    assert AccountStore.load().active_slot == 2
+    entry = unclaimed.resolve(rescued)
+    assert entry.claimable is False
+    assert entry.label() == "unreadable login"
+    with pytest.raises(errors.UserError, match="cannot be registered"):
+        unclaimed.credential(rescued)
+
+
+def test_syncing_back_an_api_key_keeps_the_label_it_was_registered_with(codex_root):
+    store = AccountStore.load()
+    store.add_token("sk-service-key", email="service@example.com", alias="svc")
+    store.add_from_auth(make_auth(email="two@example.com", account_id="acct-2"))
+    store.set_active(1)
+    # Codex rewrote the live file for the same key, so sync-back adopts it.
+    paths.atomic_write_json(paths.live_auth_path(), {
+        "auth_mode": "apikey", "OPENAI_API_KEY": "sk-service-key", "tokens": None,
+        "last_refresh": "2026-09-09T00:00:00Z"})
 
     switcher.activate(store, store.get(2), force=True)
 
-    assert AccountStore.load().active_slot == 2
+    reloaded = AccountStore.load()
+    assert reloaded.get(1).identity.email == "service@example.com"
+    assert reloaded.get(1).identity.plan_type == "api key"
+    assert reloaded.find_by_email("service@example.com") is not None
 
 
 def test_an_unusable_live_file_does_not_block_a_switch(codex_root, monkeypatch):

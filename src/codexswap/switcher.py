@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Mapping, Optional, Sequence, Set
 
@@ -265,39 +265,76 @@ def capture_current(
         return account
 
 
-def _slot_holding_api_key(store: AccountStore, key: Optional[str]):
-    """The slot whose stored auth is exactly this API key, if any. Caller holds the lock."""
-    if not isinstance(key, str) or not key:
+def _stored_auth(store: AccountStore, slot: int) -> Optional[dict]:
+    with suppress(errors.AuthFileMissing, errors.AuthFileInvalid, OSError, ValueError):
+        return identity.load_auth(store.path_for(paths.slot_auth_path(slot)))
+    return None
+
+
+def slot_owning(store: AccountStore, auth: dict) -> Optional[Account]:
+    """The slot that already holds this credential, or None. Callers hold the lock.
+
+    Every match is confirmed against the slot's own auth file, never against the
+    registry's recorded identity. The registry is a cache that drifts; the file is
+    the thing that would still hold the credential after the live copy is gone, and
+    the only question here is whether a copy survives.
+
+    The order matters because the answer decides whether a login is about to be
+    destroyed:
+
+    * identical bytes: unambiguous, and the only handle a credential that carries
+      neither an account id nor an email ever has;
+    * account id: authoritative when both sides have one. An email is deliberately
+      not consulted then, so one person's login cannot pass as another's just
+      because a slot was labelled with the same address;
+    * API key: the key itself, whatever the registry thinks the slot's mode is;
+    * email: only when neither side has an account id, so an API key's assigned
+      label can never stand in for an OAuth login.
+    """
+    if not isinstance(auth, dict) or not auth:
         return None
+    derived = identity.identity_from_auth(auth)
+    key = auth.get("OPENAI_API_KEY")
     for account in store.ordered():
-        if account.identity.auth_mode != "apikey":
+        stored = _stored_auth(store, account.slot)
+        if not isinstance(stored, dict) or not stored:
             continue
-        with suppress(errors.AuthFileMissing, errors.AuthFileInvalid, OSError, ValueError):
-            stored = identity.load_auth(store.path_for(paths.slot_auth_path(account.slot)))
-            if stored.get("OPENAI_API_KEY") == key:
-                return account
+        if stored == auth:
+            return account
+        mine = identity.identity_from_auth(stored)
+        if derived.account_id and mine.account_id == derived.account_id:
+            return account
+        if isinstance(key, str) and key and stored.get("OPENAI_API_KEY") == key:
+            return account
+        if (not derived.account_id and not mine.account_id and derived.email
+                and mine.email and mine.email.casefold() == derived.email.casefold()):
+            return account
     return None
 
 
 def live_credential_is_registered(store: AccountStore) -> bool:
-    """Whether the live auth file belongs to an account this store knows.
+    """Whether the live auth file is already saved in some slot.
 
-    `activate` overwrites the live file, so a credential no account owns is destroyed
+    `activate` overwrites the live file, so a credential no slot holds is destroyed
     by the switch. A `codex login` that was never followed by `codexswap add` is
     exactly that case, and it is the one where the user has no other copy.
+
+    A file that will not parse answers False: this cannot tell a half-written file
+    from a format it does not understand, and only one of those is safe to discard.
+    A file that parses but carries no credential answers True, because there is
+    nothing in it to lose.
     """
     try:
         auth = identity.load_auth(paths.live_auth_path())
+    except errors.AuthFileMissing:
+        return True
+    except (OSError, ValueError, errors.AuthFileInvalid):
+        return False
+    try:
         identity.validate_auth(auth)
-    except (OSError, ValueError, errors.AuthFileMissing, errors.AuthFileInvalid):
-        # Nothing usable is there, so nothing usable can be lost.
+    except errors.CodexSwapError:
         return True
-    derived = identity.identity_from_auth(auth)
-    if derived.account_id is not None and store.find_by_account_id(derived.account_id):
-        return True
-    if derived.email is not None and store.find_by_email(derived.email):
-        return True
-    return _slot_holding_api_key(store, auth.get("OPENAI_API_KEY")) is not None
+    return slot_owning(store, auth) is not None
 
 
 def sync_live_to_slot(store: AccountStore) -> Optional[int]:
@@ -308,7 +345,9 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
         store.reload()
         try:
             auth = identity.load_auth(paths.live_auth_path())
-        except errors.AuthFileMissing:
+        except (errors.AuthFileMissing, errors.AuthFileInvalid):
+            # A file that will not parse has nothing to sync back. It is not
+            # discarded: activate rescues the bytes before it overwrites them.
             return None
         try:
             # Sync-back exists to preserve a refreshed credential. An unusable live
@@ -318,16 +357,14 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
         except errors.AuthFileInvalid:
             return None
         derived = identity.identity_from_auth(auth)
-        account = (store.find_by_account_id(derived.account_id)
-                   if derived.account_id is not None else None)
-        if account is None and derived.email is not None:
-            account = store.find_by_email(derived.email)
-        if account is None and derived.auth_mode == "apikey":
-            # An API key carries no account id and no email of its own, so the key
-            # itself is the only thing that identifies it.
-            account = _slot_holding_api_key(store, auth.get("OPENAI_API_KEY"))
+        account = slot_owning(store, auth)
         if account is None:
             return None
+        if derived.auth_mode == "apikey":
+            # An API key carries no email and no plan of its own. The label given at
+            # registration is the only identity it has, and writing None over it
+            # would make the account unfindable by the name the user gave it.
+            derived = replace(derived, email=account.identity.email, plan_type="api key")
         slot_auth = store.path_for(paths.slot_auth_path(account.slot))
         stored: Optional[dict] = None
         if slot_auth.is_file():
@@ -346,9 +383,56 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
         return account.slot
 
 
+_UNREGISTERED = "live login belonged to no registered account"
+_UNREADABLE = "live login could not be parsed and was about to be overwritten"
+
+
+def rescue_unregistered_live(store: AccountStore) -> Optional[str]:
+    """Preserve the live credential when no slot holds it. Callers hold the lock.
+
+    Returns the stash id, or None when there was nothing worth preserving. Raising
+    means the credential could not be preserved, and the caller must then leave it
+    alone: the whole point is that overwriting is irreversible.
+
+    Called as late as possible, immediately before the overwrite, because the file
+    belongs to Codex and Codex may be writing it.
+    """
+    from . import unclaimed
+
+    path = paths.live_auth_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        return None
+    except (OSError, UnicodeError):
+        raise errors.UserError(
+            "The live Codex login cannot be read, so switching would overwrite "
+            "something that could not be preserved first"
+        ) from None
+    try:
+        auth = json.loads(raw)
+    except ValueError:
+        # A file caught mid-write and one written by a Codex release this version
+        # does not understand look identical from here. Keep the bytes.
+        return unclaimed.stash_raw(raw, reason=_UNREADABLE)
+    try:
+        identity.validate_auth(auth)
+    except errors.CodexSwapError:
+        return None
+    if slot_owning(store, auth) is not None:
+        return None
+    return unclaimed.stash(auth, reason=_UNREGISTERED)
+
+
 def activate(
     store: AccountStore, target: Account, *, force: bool = False, sync_back: bool = True,
-) -> None:
+) -> Optional[str]:
+    """Make `target` the live account. Returns a rescue id when one was needed.
+
+    A login the registry does not know is copied into the unclaimed stash before it
+    is overwritten, rather than refused. Refusing would be safe for the credential
+    and useless for the user; overwriting would be the opposite.
+    """
     if not force:
         processes = detect_running_codex()
         if processes is None:
@@ -360,11 +444,6 @@ def activate(
             raise errors.CodexRunning(f"{describe_running(processes)}. Close them or pass --force")
     with FileLock(store.path_for(paths.lock_path())):
         store.reload()
-        if not force and not live_credential_is_registered(store):
-            raise errors.UserError(
-                "The live Codex login belongs to no registered account, and switching "
-                "would overwrite it. Run codexswap add to keep it, or pass --force"
-            )
         target = store.get(target.slot)
         auth_path = store.path_for(paths.slot_auth_path(target.slot))
         if not auth_path.is_file():
@@ -382,11 +461,15 @@ def activate(
             auth = identity.validate_auth(
                 identity.load_auth(auth_path), source=f"Slot {target.slot} auth file"
             )
+        # Last thing before the overwrite, so the window in which Codex could finish
+        # writing a login this check did not see is as small as it can be made.
+        rescued = rescue_unregistered_live(store)
         paths.ensure_dir(paths.codex_home())
         paths.atomic_write_json(paths.live_auth_path(), auth, mode=0o600)
         store.active_slot = target.slot
         target.last_switched_at = paths.iso_now()
         store.save()
+        return rescued
 
 
 def slot_env(slot: int, base_env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from datetime import datetime
 
@@ -533,6 +534,57 @@ def test_an_unreadable_history_refuses_to_reserve(tmp_path):
     _, reserved = _reserve(journal, at=NOW, slot=1, credit="c1", cap=1, now=NOW)
 
     assert reserved is False
+
+
+def test_a_save_cannot_hand_back_a_cap_whose_history_was_lost(tmp_path):
+    """The daemon saves after every tick; that must not launder unknown history."""
+    root = tmp_path / "survives"
+    root.mkdir()
+    (root / "state.json").write_text("{ truncated", encoding="utf-8")
+
+    # One ordinary tick's worth of bookkeeping, exactly as `auto.run` does it.
+    state = auto.AutoState.load(root)
+    assert state.unreadable is True
+    state.save(root)
+
+    reloaded = auto.AutoState.load(root)
+    assert reloaded.unreadable is False, "the document parses again, as it should"
+    assert reloaded.history_is_unknown(NOW) is True
+    journal = auto.RedemptionJournal(reloaded, root=root, persist=True)
+    _, reserved = _reserve(journal, at=NOW, slot=1, credit="c1", cap=1, now=NOW)
+    assert reserved is False
+
+
+def test_lost_history_stops_mattering_once_the_cap_window_has_passed(tmp_path):
+    """After 24 hours no lost entry could still count, so refusing forever is wrong."""
+    root = tmp_path / "expires"
+    root.mkdir()
+    (root / "state.json").write_text("[]", encoding="utf-8")
+    state = auto.AutoState.load(root)
+    assert state.unreadable is True, "a JSON array is not a state document"
+    state.save(root)
+
+    reloaded = auto.AutoState.load(root)
+    since = reloaded.history_unknown_since
+    assert since is not None
+    assert reloaded.history_is_unknown(since + 86399) is True
+    assert reloaded.history_is_unknown(since + 86401) is False
+
+
+def test_the_marker_is_dropped_once_it_expires(tmp_path):
+    """A readable document stops carrying a stamp that can no longer mean anything."""
+    root = tmp_path / "cleared"
+    root.mkdir()
+    (root / "state.json").write_text(json.dumps({
+        "redemptions": [], "historyUnknownSince": time.time() - 2 * 86400,
+    }), encoding="utf-8")
+    state = auto.AutoState.load(root)
+    assert state.history_is_unknown(time.time()) is False
+
+    state.save(root)
+
+    assert "historyUnknownSince" not in json.loads(
+        (root / "state.json").read_text(encoding="utf-8"))
 
 
 def test_a_missing_history_is_not_treated_as_unreadable(tmp_path):

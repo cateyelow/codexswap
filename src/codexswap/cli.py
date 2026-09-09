@@ -170,6 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
     child = command("import", "Import accounts and credentials from a file")
     child.add_argument("path", type=Path)
     child.add_argument("--force", action="store_true")
+    child = command("unclaimed", "List, register, or drop credentials a switch rescued")
+    child.add_argument("--claim", metavar="ID", help="register a stashed credential as an account")
+    child.add_argument("--purge", metavar="ID", help="delete a stashed credential")
+    child.add_argument("--slot", type=int, metavar="N", help="with --claim, the slot to use")
+    child.add_argument("--alias", metavar="NAME", help="with --claim, an alias for the account")
+    _json_flag(child)
     child = command("purge", "Delete the entire codexswap home")
     child.add_argument("--yes", action="store_true", help="confirm deletion")
     return parser
@@ -521,6 +527,51 @@ def _config(args, settings):
     return 0
 
 
+def _unclaimed(args, store, color):
+    """Show, register, or drop the credentials a switch rescued.
+
+    Listing never touches the `auth` member of an entry: only `--claim` reads a
+    stashed credential back out, and only to hand it to the registry.
+    """
+    from . import unclaimed
+
+    if args.claim is not None and args.purge is not None:
+        raise errors.UserError("use --claim or --purge, not both")
+    if args.claim is None and (args.slot is not None or args.alias is not None):
+        raise errors.UserError("--slot and --alias apply to --claim")
+    if args.purge is not None:
+        entry = unclaimed.resolve(args.purge)
+        unclaimed.discard(entry.id)
+        if args.json:
+            _print_json({"purged": entry.id, "email": entry.email})
+        else:
+            print(f"dropped rescued credential {entry.id} ({entry.label()})")
+        return 0
+    if args.claim is not None:
+        entry = unclaimed.resolve(args.claim)
+        account = store.add_from_auth(unclaimed.credential(entry.id), slot=args.slot,
+                                      alias=args.alias)
+        # Drop the rescue copy only once the registry provably holds the credential.
+        unclaimed.discard(entry.id)
+        if args.json:
+            _print_json({"claimed": entry.id, "slot": account.slot,
+                         "email": account.identity.email})
+        else:
+            print(f"claimed {entry.id} into slot {account.slot} ({account.display()})")
+        return 0
+    found = unclaimed.entries()
+    if args.json:
+        _print_json({"unclaimed": [
+            {"id": entry.id, "stashedAt": entry.stashed_at, "reason": entry.reason,
+             "email": entry.email, "accountId": entry.account_id,
+             "planType": entry.plan_type, "authMode": entry.auth_mode}
+            for entry in found
+        ]})
+    else:
+        print(render.render_unclaimed(found, color=color))
+    return 0
+
+
 def _purge(args):
     configured = paths.codexswap_home().expanduser()
     root = configured.resolve()
@@ -725,6 +776,8 @@ def _dispatch(args, parser):
     store = AccountStore.load()
     if args.command == "add-token":
         return _add_token(args, store)
+    if args.command == "unclaimed":
+        return _unclaimed(args, store, color)
     if args.command == "sync-config":
         lines = store.sync_config(args.ref, source=args.source, force=args.force)
         for line in lines:

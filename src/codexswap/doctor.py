@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, appserver, errors, identity, locking, paths, switcher
+from . import __version__, appserver, errors, identity, locking, paths, switcher, unclaimed
 from .models import HEALTH_OK, Account
 from .settings import SPECS
 
@@ -215,6 +215,18 @@ def collect_checks() -> Dict[str, Any]:
         add("live.auth", "warn", "auth.json absent")
     except (OSError, ValueError, errors.AuthFileInvalid):
         add("live.auth", "fail", "auth.json unreadable or invalid")
+
+    # A rescued credential is invisible otherwise: the switch that saved it printed one
+    # line and moved on. Left unclaimed it is both a lost account and a credential
+    # sitting on disk that nothing is using.
+    rescued = unclaimed.entries()
+    if rescued:
+        add("unclaimed", "warn",
+            "{} rescued credential{} not registered: {}; run: codexswap unclaimed".format(
+                len(rescued), "" if len(rescued) == 1 else "s",
+                ", ".join(entry.id for entry in rescued)))
+    else:
+        add("unclaimed", "ok", "no rescued credentials")
 
     checks.extend(_settings_checks(root))
     checks.append({"name": "lock", **_lock_check(root / ".lock")})

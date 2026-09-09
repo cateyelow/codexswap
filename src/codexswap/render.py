@@ -219,6 +219,23 @@ def render_config(items) -> str:
     )
 
 
+def render_unclaimed(entries, *, color) -> str:
+    entries = list(entries)
+    if not entries:
+        return "  no rescued credentials"
+    rows = ["  These logins were about to be overwritten and belong to no account.",
+            "  Register one with: codexswap unclaimed --claim <id>", ""]
+    width = max(len(_ascii(entry.id)) for entry in entries)
+    for entry in entries:
+        label = colorize(_ascii(entry.label()), CYAN, enabled=color)
+        rows.append(f"  {_ascii(entry.id).ljust(width)}  {label}")
+        detail = "stashed " + (_ascii(entry.stashed_at) or "at an unknown time")
+        if entry.plan_type:
+            detail += f"  [{_ascii(entry.plan_type)}]"
+        rows.append("  {}  {}".format(" " * width, colorize(detail, DIM, enabled=color)))
+    return "\n".join(rows)
+
+
 def render_mappings(pairs) -> str:
     pairs = list(pairs.items() if hasattr(pairs, "items") else pairs)
     if not pairs:
