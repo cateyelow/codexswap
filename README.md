@@ -42,8 +42,14 @@ uv tool install .          # Or: pip install -e ".[dev]" for a development check
 
 ## Quick start
 
+`codexswap add` copies the login Codex has already written, so run `codex login`
+first: an installed Codex CLI with no `~/.codex/auth.json` yet has nothing to save.
 Use the normal Codex home (`~/.codex`) for these logins. During the second login,
 choose the other account in the browser.
+
+Switching rewrites `~/.codex/auth.json`, which a Codex session already running does
+not re-read. Start your Codex work after switching, not before -- and `auto` below
+runs in its own terminal, because it does not start a Codex session of its own.
 
 The last command runs in the foreground until you press Ctrl+C, and its default
 policy **may spend a reset credit** that is close to expiring. Redemption cannot be
@@ -58,6 +64,9 @@ codexswap add --alias work        # Save the second account in another slot.
 codexswap list                    # Show saved accounts, usage, and reset credits.
 codexswap auto                    # Monitor usage and apply switching/reset policy.
 ```
+
+`codexswap list` after the second `add` should show two slots with different email
+addresses. One slot means both logins were the same account.
 
 ## How it works
 
@@ -109,7 +118,10 @@ Square brackets indicate optional arguments. `<ref>` resolves by slot number,
 case-insensitive alias, case-insensitive email, then unique email prefix. An
 ambiguous reference reports the matching candidates rather than picking one:
 aliases must be unique, and `codexswap alias` refuses a name another slot already
-uses. A directory mapping follows its account through `move`, `swap` and `remove`,
+uses. `import` is the exception: it preserves every entry it is given, so an archive
+can bring in an alias a slot already answers to. Nothing guesses between them --
+the reference is reported ambiguous until you re-alias one, and the slot number
+always works. A directory mapping follows its account through `move`, `swap` and `remove`,
 so it never silently transfers to whichever account lands in that slot next.
 
 | Command | Description |
@@ -134,18 +146,46 @@ so it never silently transfers to whichever account lands in that slot next.
 | `codexswap run [<ref>] [-- <codex args>...]` | Run Codex in a slot's home, using the current directory's mapping if no reference is given. |
 | `codexswap map [<ref> [path]]` | List directory mappings or map a directory to an account. |
 | `codexswap unmap [path]` | Remove a directory mapping, defaulting to the current directory. |
-| `codexswap probe [<ref>] [--backend] [--json]` | Probe usage for the selected account. |
-| `codexswap reset [list] [--json]` | List the active account's banked reset credits. |
+| `codexswap probe [<ref>] [--backend] [--json]` | Probe usage now, for one account or, with no ref, every enabled account. |
+| `codexswap reset [list] [--json]` | List the active account's reset credits, redeemed and expired ones included. |
 | `codexswap reset use [<ref>] [--credit ID] [--yes] [--dry-run]` | Redeem a reset credit with confirmation, or preview the redemption. |
 | `codexswap auto [--once] [--dry-run] [--interval N] [--threshold N] [--model NAMES]` | Run automatic monitoring, optionally for one tick or without switching or redeeming. |
 | `codexswap config [set <KEY> <VALUE> \| unset <KEY>] [--json]` | Show settings, set a validated value, or restore a default. |
 | `codexswap export <path> [--account <ref>]` | Export all accounts or one account, including credentials. |
 | `codexswap import <path> [--force]` | Import accounts, remapping occupied slots unless overwrite is explicitly forced. |
+| `codexswap unclaimed [--claim ID [--slot N] [--alias NAME]] [--purge ID] [--json]` | List logins a switch rescued, register one as an account, or drop one. |
 | `codexswap purge [--yes]` | Delete the entire codexswap data root after confirmation, leaving `~/.codex` untouched. |
 
 Global flags: `--debug`, `--version`, `--no-color`, and `--home PATH`. The last
 overrides the `CODEXSWAP_HOME` storage root, which otherwise defaults to
 `~/.codexswap`.
+
+## Rescued logins
+
+Switching writes the target account's credential over `~/.codex/auth.json`. If the
+file it replaces belongs to no saved slot -- a `codex login` you never ran
+`codexswap add` on, or something else rewriting the live login -- overwriting it ends
+that login for good, because an OAuth authorisation code is single-use.
+
+So the switch copies it into `<root>/unclaimed/` first and then proceeds. Nothing is
+blocked and nothing is lost. `auto` does the same; being unattended is not a licence
+to destroy an account you never registered.
+
+```sh
+codexswap unclaimed                       # What was rescued, and when.
+codexswap unclaimed --claim 20260909T0113Z-f160d6 --alias spare
+codexswap unclaimed --purge 20260909T0113Z-f160d6
+```
+
+`--claim` registers the credential as an account and only then drops the rescue copy;
+if registration fails the copy stays. `--purge` deletes one for good. Listing never
+prints the credential itself, and the files are written `0600` inside a `0700`
+directory. `codexswap doctor` warns while any are waiting, so a rescue is not one
+line of output you scrolled past.
+
+A live file that will not parse is kept too, as raw bytes. A file caught mid-write
+and one written by a newer Codex look the same from here, and only one of them is
+junk. Those entries cannot be claimed; look at the file and decide.
 
 ## API-key accounts
 
@@ -189,8 +229,11 @@ output and works on Windows without curses.
 
 `codexswap upgrade` prints the exact detected uv, pipx, or Python/pip command and
 asks before running it; `--yes` confirms execution. Declining or EOF cancels it.
-Source/editable checkouts and ambiguous installations list all three candidate
-commands and exit 2 without running anything, even with `--yes`. In `--json` mode,
+An installation with no detectable manager -- a plain source checkout -- and one
+with conflicting evidence list all three candidate commands and exit 2 without
+running anything, even with `--yes`. A checkout that nonetheless sits inside a uv or
+pipx environment is not ambiguous: that prefix names the manager, and the command it
+prints is that one. In `--json` mode,
 stdout contains one result object; prompts and package-manager output go to stderr.
 
 ## Reset credits
@@ -224,9 +267,15 @@ account.
 Inspect and preview without spending a credit:
 
 ```sh
-codexswap reset                    # List the active account's available credits.
+codexswap reset                    # List this account's credits, spent ones included.
 codexswap reset use --dry-run      # Show what would be redeemed without redeeming.
 ```
+
+**`reset use` spends one of that account's banked credits and cannot be undone.** It
+is the manual path, so it deliberately ignores everything the automatic policy weighs:
+`reset.policy`, `reset.minUsagePercent` and `reset.maxPerDay` do not apply, and the
+redemption is not written to the daemon's ledger. `reset.maxPerDay` therefore limits
+automatic redemptions only -- it is not a cap on how many you can spend by hand.
 
 For an explicit manual redemption:
 
@@ -302,7 +351,12 @@ codexswap auto --once --dry-run
 Dry runs perform reads and decisions, but neither switch accounts nor redeem
 credits, and codexswap writes nothing at all: not `state.json`, not the account
 registry, not the usage cache, and not the log. A preview that cached what it read
-would let the next real tick skip its own probe, so each dry tick probes afresh.
+would let the next real tick skip its own probe, so each dry tick probes the active
+account afresh. Two consequences follow from writing nothing. A dry tick still reuses
+a *pre-existing* cache entry for the other accounts, because that entry is already on
+disk. And counters that only a save could carry forward -- the consecutive-failure
+count above, the cooldown -- restart every tick, so a continuous dry run shows each
+tick's decision in isolation rather than the sequence a real run would take.
 
 A dry run still *reads* usage, which means starting Codex against each slot home.
 Codex may update its own state or refresh a credential there; that is Codex writing
@@ -312,9 +366,11 @@ A running `codexswap auto` re-reads its settings every tick, so `codexswap confi
 takes effect without restarting it. Values passed as `--interval`, `--threshold`, or
 `--model` keep overriding the file.
 
-An automatic switch rewrites the live credential file. Because the daemon is
-unattended, it does **not** apply the running-process guard that manual
-`codexswap switch` uses: it would otherwise stall forever whenever a Codex session
+An automatic switch rewrites the live credential file. If that file holds a login no
+slot has a copy of, it is rescued into `<root>/unclaimed/` first, exactly as a manual
+switch does, so an unattended daemon cannot destroy an account you never registered.
+Because the daemon is unattended, it does **not** apply the running-process guard that
+manual `codexswap switch` uses: it would otherwise stall forever whenever a Codex session
 was open. A Codex process that is already running keeps the credentials it loaded,
 so it is not migrated to the new account; the switch takes effect for sessions
 started afterwards. Use `codexswap run <ref>` when you want a session pinned to a
@@ -415,8 +471,9 @@ Boolean values also accept `1`/`0`, `yes`/`no`, and `on`/`off`, case-insensitive
 Unknown keys and values outside the allowed choices or bounds are rejected.
 
 The same validation applies to values already stored in `settings.json`, in case the
-file was hand-edited or written by an older release. An invalid value is reported once
-on stderr, the documented default is used in its place, and the line stays in the file
+file was hand-edited or written by an older release. An invalid value is reported on
+stderr once per load -- which for `auto` means once per tick, since it re-reads the
+file so `config set` takes effect in a running daemon -- the documented default is used in its place, and the line stays in the file
 until you set that key again. `reset.policy` is the exception to falling back: an
 unrecognised policy disables automatic redemption entirely rather than applying the
 default rule to credits you cannot get back.
@@ -511,7 +568,9 @@ Those paths make authenticated requests directly to OpenAI's undocumented
 these endpoints are unsupported and may change.
 
 `codexswap probe --backend` uses that fallback for one run; the setting enables it
-whenever the supported path fails. It reads only what section 1.5 of `CONTRACT.md`
+for `list`, `status`, `probe` and `reset` when the app-server probe fails for a reason
+other than a rejected credential. It is deliberately *not* wired into `auto`: an
+unattended loop must not start making undocumented requests on its own. It reads only what section 1.5 of `CONTRACT.md`
 records: an unrecognised usage payload leaves usage unknown rather than inventing
 numbers, and reset credits come from the endpoint whose shape is documented.
 
@@ -554,8 +613,9 @@ import seeds a missing config from the destination machine's live Codex home.
   stored on the other machine. Re-login and re-add the account on the affected
   machine; copying an older auth file cannot restore an invalidated token.
 - **Usage is marked `stale`, or auto mode finds no target:** Stale usage means the
-  number on screen came from the cache and is older than `probe.staleSeconds`, either
-  because a probe failed or because nothing has probed that account recently. Check `CODEX_BIN`, connectivity,
+  number on screen did not come from a probe made for this command: either it is
+  older than `probe.staleSeconds` and nothing refreshed it, or a probe was attempted
+  and failed, in which case the cached figure is shown as stale however recent it is. Check `CODEX_BIN`, connectivity,
   and login health. For selection, check enabled accounts and hysteresis: with
   defaults, a known-usage target must be at or below 70%, not merely below 80%.
 - **No usage appears for an API-key account:** API-key accounts are supported,

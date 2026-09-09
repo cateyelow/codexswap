@@ -50,7 +50,7 @@ def decide(
     percent = snapshot.binding_percent
     if percent is None:
         return ResetDecision(False, None, "no-usage-data")
-    credit = snapshot.soonest_expiring_credit()
+    credit = snapshot.soonest_expiring_credit(now)
     if percent < settings.reset_min_usage_percent:
         return ResetDecision(False, credit, "usage-too-low")
     if policy == "expiring":

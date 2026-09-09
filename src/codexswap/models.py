@@ -152,7 +152,17 @@ class ResetCredit:
 
     @property
     def is_available(self) -> bool:
+        """What the server said. The server is authoritative for redeemability."""
         return self.status == "available"
+
+    def is_usable(self, now: float) -> bool:
+        """Available, and not already past the expiry the same reading reported.
+
+        A cached reading can outlive a credit. Choosing an expired one costs a
+        round-trip that fails and, because a failed attempt's outcome is unknown, a
+        slot in the daily cap.
+        """
+        return self.is_available and (self.expires_at is None or self.expires_at > now)
 
     def days_until_expiry(self, now: float) -> Optional[float]:
         if self.expires_at is None:
@@ -297,9 +307,13 @@ class UsageSnapshot:
     def available_reset_count(self) -> int:
         return len(self.available_reset_credits)
 
-    def soonest_expiring_credit(self) -> Optional[ResetCredit]:
+    def soonest_expiring_credit(self, now: Optional[float] = None) -> Optional[ResetCredit]:
+        """The credit to spend first. Pass `now` to skip ones already expired."""
+        candidates = (self.available_reset_credits if now is None
+                      else tuple(credit for credit in self.reset_credits
+                                 if credit.is_usable(now)))
         return min(
-            self.available_reset_credits,
+            candidates,
             key=lambda credit: (credit.expires_at is None, credit.expires_at or 0),
             default=None,
         )

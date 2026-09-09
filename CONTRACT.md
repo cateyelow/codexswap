@@ -220,6 +220,7 @@ Root is `$CODEXSWAP_HOME` if set, else `~/.codexswap`.
   homes/<slot>/          # a complete CODEX_HOME per slot
   homes/<slot>/auth.json # authoritative credential for that slot
   homes/<slot>/config.toml # optional account-specific Codex configuration
+  unclaimed/<id>.json    # a credential a switch rescued (section 3.5)
   .lock                  # advisory lock file
 ```
 
@@ -394,10 +395,52 @@ original is gone. Three rules keep that from happening:
   rotate, so blindly copying an older live file over a newer slot file can void the
   account. When either stamp is missing or unreadable the live copy wins, as before.
 
+### 3.5 Nothing is overwritten that nothing else holds
+
+`activate` writes the target's credential over `~/.codex/auth.json`. If the file it
+replaces belongs to no slot, that switch is the end of that login: an OAuth
+authorisation code is single-use, so getting it back means authorising the account
+again from scratch. Refusing the switch would protect the credential and block the
+user; `switcher.rescue_unregistered_live` does neither, and copies it aside instead.
+
+- Called from `activate` immediately before the overwrite, holding the lock, so the
+  window in which Codex could finish writing a login this check did not see is as
+  small as it can be made. It is not skipped by `--force`, which is about a running
+  Codex, and not by `auto`, which switches unattended.
+- `switcher.slot_owning(store, auth)` decides whether a copy already exists, and
+  confirms every match against the slot's own `auth.json` rather than the registry's
+  recorded identity: the registry is a cache that drifts, the file is what would
+  survive. In order: identical bytes; the same `account_id` when both sides have one;
+  the same `OPENAI_API_KEY`; and finally the same email, but only when *neither* side
+  has an account id, so a slot's label can never make one account's login pass as
+  another's.
+- A live file that will not parse is kept as raw bytes (`unclaimed.stash_raw`). A
+  half-written file and one from a Codex release this version does not understand are
+  indistinguishable here, and only one of them is junk. A file that parses but carries
+  no credential is not kept: there is nothing in it to lose.
+- If the copy cannot be written, `activate` raises and writes nothing. Failing to
+  preserve is the one condition that must stop the switch.
+- Entries are `<root>/unclaimed/<id>.json`, mode `0600`, in a `0700` directory. `<id>`
+  leads with a compacted UTC timestamp so a plain sort is chronological. Each holds
+  the credential under `auth` (or the bytes under `raw`) plus `stashedAt`, `reason`,
+  `email`, `accountId`, `planType`, `authMode` and a SHA-256 `fingerprint`. The
+  fingerprint deduplicates: a live file something outside this tool keeps rewriting
+  produces one entry, not one per switch.
+- `codexswap unclaimed` lists them and never reads `auth`. `--claim ID` registers one
+  through `AccountStore.add_from_auth` and drops the copy only after that succeeds;
+  `--purge ID` deletes one. A `raw` entry cannot be claimed. An id that is not a bare
+  filename is refused, so `--purge` cannot name a file outside the directory.
+- `doctor` reports a `unclaimed` check: `warn` while any are waiting, naming the ids.
+  A rescue is otherwise one line of output on a command the user ran for another
+  reason.
+
 ### 3.3 Registry consistency
 
 `AccountStore.load()` runs outside the lock, so an in-memory registry is a snapshot
-that another process can invalidate. `AccountStore.reload()` re-reads it inside the
+that another process can invalidate. It also renames a corrupt registry aside and
+carries on with an empty one -- except for `load(quarantine=False)`, which reports the
+corruption and leaves the file alone. `auto --dry-run` uses that: renaming a file is a
+write, and a dry run promises none. `AccountStore.reload()` re-reads it inside the
 lock, refreshing existing `Account` objects in place so a caller holding one keeps a
 live view. Every mutating method calls it first, as do `switcher.activate`,
 `switcher.sync_live_to_slot` and `transfer.import_accounts`, which hold the lock
@@ -607,9 +650,16 @@ ordering: credits with an `expires_at` sort before those without).
 def redeem(
     codex_home: Path, *, credit_id: Optional[str] = None,
     idempotency_key: Optional[str] = None, timeout: float = 45.0,
+    expect_account_id: Optional[str] = None,
     client_factory=None,   # for tests; defaults to appserver.AppServerClient
 ) -> str                   # returns the outcome string
 ```
+
+`expect_account_id` is the account the decision was made about. The usage read and
+this call open separate app-server sessions against a directory anything can write in
+between, so the slot's `auth.json` is re-read here and the redemption refused when it
+names a different account -- or no account at all, which given that the caller only
+supplies this when its reading named one, means the same thing.
 
 `idempotency_key` defaults to `str(uuid.uuid4())`. Callers that retry the *same logical
 attempt* must pass the same key back in.
@@ -662,9 +712,16 @@ protect it beyond the reservation lock:
   the daily cap still counts. A burst of `noCredit` attempts would otherwise push a
   real spend out of the file; those attempts are themselves droppable, so the bound
   still holds where it matters.
-- `RedemptionJournal.reserve` refuses when `state.json` exists and did not parse. An
-  unreadable history is not an empty one, and spending against it is spending against
-  a cap whose usage is unknown.
+- `RedemptionJournal.reserve` refuses when the history is unknown: `state.json` exists
+  and did not parse, or is not a JSON object, or carries a `historyUnknownSince` stamp
+  less than 24 hours old. An unreadable history is not an empty one, and spending
+  against it is spending against a cap whose usage is unknown.
+- `save()` writes `historyUnknownSince` into the document that replaces an unreadable
+  one, keeping the later of its own stamp and the stored one. Without it the refusal
+  would last exactly one tick: the daemon saves after every pass, and that save turns
+  an unreadable document into a valid empty ledger. The stamp is dropped once it is
+  more than 24 hours old, because by then no lost entry could still count against the
+  daily cap, and a permanent refusal would be its own failure.
 
 `probe(account) -> UsageSnapshot`, `redeemer(account, credit_id) -> str` and
 `activator(account) -> None` are injected so `tick` is unit-testable with no
@@ -717,9 +774,10 @@ its own probe. The cost is that consecutive dry ticks each probe afresh.
 running. `--interval` / `--threshold` are reapplied after each reload, so an explicit
 command-line override always outranks the file.
 
-Hysteresis: a candidate is only a valid target when its
-`binding_percent <= threshold - hysteresisPct`. This prevents ping-ponging between two
-accounts that both hover at the threshold.
+Hysteresis: a candidate is only a valid target when the figure selection is using is
+at or below `threshold - hysteresisPct`. That figure is `binding_percent` by default,
+and the highest of the named per-model limits when `autoswitch.model` or `--model` is
+set. This prevents ping-ponging between two accounts that both hover at the threshold.
 
 ---
 
@@ -786,6 +844,7 @@ codexswap list [--json] [--token-status] [--no-probe]      (alias: ls)
 codexswap status [--json]                                  (alias: current, st)
 codexswap switch [<ref>] [--strategy best|next-available] [--model NAMES] [--force] [--json]
 codexswap add [--slot N] [--alias NAME]
+codexswap unclaimed [--claim ID [--slot N] [--alias NAME]] [--purge ID] [--json]
 codexswap add-token [TOKEN|-] [--slot N] [--email EMAIL] [--alias NAME]
 codexswap sync-config [<ref>] [--from PATH] [--force]
 codexswap doctor [--json]
@@ -843,8 +902,27 @@ Behaviour notes:
   redeemed and exits 0 without calling the backend.
 - `purge` requires `--yes` or an interactive `yes` answer; it deletes `<root>` entirely
   and never touches `~/.codex`.
+- `unclaimed` with no flags lists the rescued credentials of section 3.5, oldest
+  first, and reads no `auth` member. `--claim ID` registers one and drops the copy
+  only after the registry holds it; `--purge ID` drops one. The two flags are mutually
+  exclusive, `--slot`/`--alias` apply to `--claim` only, and each rejection is a
+  `UserError` (2). An id naming a `raw` entry, or one that is not a bare filename, is
+  refused.
 
-Exit codes come from the exception table in section 4; success is 0.
+Exit codes come from the exception table in section 4; success is 0. Six commands
+depart from "nonzero means the command failed", and a script must know which:
+
+- `run` exits with Codex's own status, whatever that is.
+- `reset use` returns 1 for any outcome other than `reset`; the redemption reached the
+  server and the server declined it.
+- `sync-config` returns 1 when any slot was skipped or failed, having processed all of
+  them.
+- `doctor` returns 1 when any check failed, and `upgrade` returns 2 when it cannot
+  name a manager. Both still print their `--json` object first.
+- `auto --once` returns 0 after an expected error: the tick is logged as `error` and
+  the daemon's contract is to keep running, not to fail.
+- `Ctrl-C` outside `watch` and `auto` returns 130; inside them it is the ordinary way
+  to stop and returns 0.
 
 ### Additional command behaviour
 
@@ -954,13 +1032,25 @@ object `list` puts in its array, under `account`. `probe` with no `<ref>` uses t
 ```
 
 `credits` lists every credit the account holds, redeemed and expired ones included, so
-a client can show history. `availableCount` counts only those still redeemable, and is
-the number the text listing and the auto policy use. Credit identifiers in this
+a client can show history. `availableCount` counts the ones the server marked
+`available`; the server is authoritative for that, and no expiry is re-derived here.
+Choosing which credit to spend does apply the expiry in the same reading
+(`soonest_expiring_credit(now)`), so a cached reading that has outlived a credit does
+not send a request that can only fail. Credit identifiers in this
 document are synthetic; a real one is an opaque handle to a specific account's credit.
 
 ```json
 {"slot":1,"creditId":"RateLimitResetCredit_example","outcome":"reset","dryRun":false}
 ```
+
+```json
+{"unclaimed":[{"id":"20260909T011324Z-f160d6","stashedAt":"2026-09-09T01:13:24Z",
+  "reason":"live login belonged to no registered account","email":"a@example.com",
+  "accountId":"acct-0000","planType":"pro","authMode":"chatgpt"}]}
+```
+
+`unclaimed --claim` emits `{"claimed":<id>,"slot":N,"email":...}` and `--purge` emits
+`{"purged":<id>,"email":...}`. No shape here carries the credential.
 
 `outcome` is `null` for a preview (`"dryRun":true`) and for a redemption the user
 declined at the prompt (`"dryRun":false`), so the two are told apart by `dryRun`.

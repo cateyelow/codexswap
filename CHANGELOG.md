@@ -19,8 +19,10 @@ First public release.
 - Fail-closed rules for everything irreversible: credentials are validated before any
   write, unreadable settings or a lost redemption history refuse to authorise a
   redemption, failed process discovery blocks a switch, a slot whose credential
-  belongs to another account is refused rather than read, and the slot's account is
-  re-checked in the moment before a credit is spent.
+  belongs to another account is refused rather than read *by a probe or a redemption*,
+  and the slot's account is re-checked in the moment before a credit is spent.
+  (`switch <ref>` validates that a slot's credential is usable, but does not compare
+  its identity with the registry; `doctor` reports slots where the two disagree.)
 - A switch never destroys a login nothing else holds. A live `auth.json` that no slot
   has a copy of is put in `<root>/unclaimed/` first, and `codexswap unclaimed` lists,
   registers (`--claim`) or drops (`--purge`) what was rescued. `doctor` reports any

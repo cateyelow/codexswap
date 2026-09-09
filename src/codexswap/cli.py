@@ -468,7 +468,7 @@ def _reset(args, store, settings, color):
                 print(f"Reset credits for slot {account.slot} (stale):")
             print(render.render_reset_list(account.slot, snapshot.reset_credits, color=color, now=now))
         return 0
-    credit = snapshot.soonest_expiring_credit()
+    credit = snapshot.soonest_expiring_credit(now)
     if args.credit is not None:
         credit = next((item for item in snapshot.available_reset_credits if item.id == args.credit),
                       None)
