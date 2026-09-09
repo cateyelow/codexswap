@@ -63,5 +63,18 @@ jobs:
           # twine below 6.1 rejects Metadata-Version 2.4+, which PEP 639 metadata is.
           pip install "twine>=6.1"
           python -m twine check --strict dist/*
+      - name: Run the built wheel before uploading it
+        env:
+          CODEXSWAP_HOME: ${{ runner.temp }}/codexswap-release
+          CODEX_HOME: ${{ runner.temp }}/codex-release
+        # The last gate before an upload that can never be taken back: run what the
+        # user will actually install, from outside the checkout.
+        run: |
+          python -m venv "${{ runner.temp }}/relenv"
+          "${{ runner.temp }}/relenv/bin/pip" install --no-index --no-deps dist/*.whl
+          cd "${{ runner.temp }}"
+          "${{ runner.temp }}/relenv/bin/codexswap" version
+          "${{ runner.temp }}/relenv/bin/codexswap" list --no-probe
+          "${{ runner.temp }}/relenv/bin/cxswap" config
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
