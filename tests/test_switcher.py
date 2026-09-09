@@ -375,3 +375,60 @@ def test_an_absent_live_file_does_not_block_a_switch(codex_root, monkeypatch):
     switcher.activate(store, store.get(2))
 
     assert AccountStore.load().active_slot == 2
+
+
+def _strip_usable_tokens(auth: dict) -> dict:
+    """Keep the identity, remove everything Codex could authenticate with."""
+    tokens = dict(auth["tokens"])
+    tokens["access_token"] = ""
+    tokens["refresh_token"] = ""
+    return dict(auth, tokens=tokens, OPENAI_API_KEY=None)
+
+
+def test_sync_back_keeps_a_slot_credential_newer_than_the_live_one(codex_root):
+    """A probe refreshes a slot, and refresh tokens rotate: writing backwards voids it."""
+    store = _two_accounts()
+    slot_auth = store.path_for(paths.slot_auth_path(1))
+    newer = make_auth(email="one@example.com", account_id="acct-1")
+    newer["tokens"]["refresh_token"] = "rt.newer.TESTONLY"
+    newer["last_refresh"] = "2026-09-08T12:00:00.000000000Z"
+    paths.atomic_write_json(slot_auth, newer)
+    older = make_auth(email="one@example.com", account_id="acct-1")
+    older["tokens"]["refresh_token"] = "rt.older.TESTONLY"
+    older["last_refresh"] = "2026-09-08T09:00:00.000000000Z"
+    paths.atomic_write_json(paths.live_auth_path(), older)
+
+    assert switcher.sync_live_to_slot(store) == 1
+
+    assert json.loads(slot_auth.read_text("utf-8")) == newer
+
+
+def test_sync_back_adopts_a_live_credential_newer_than_the_slot(codex_root):
+    """The control: the direction sync-back exists for still works."""
+    store = _two_accounts()
+    slot_auth = store.path_for(paths.slot_auth_path(1))
+    older = make_auth(email="one@example.com", account_id="acct-1")
+    older["last_refresh"] = "2026-09-08T09:00:00.000000000Z"
+    paths.atomic_write_json(slot_auth, older)
+    newer = make_auth(email="one@example.com", account_id="acct-1")
+    newer["tokens"]["refresh_token"] = "rt.fresh.TESTONLY"
+    newer["last_refresh"] = "2026-09-08T12:00:00.000000000Z"
+    paths.atomic_write_json(paths.live_auth_path(), newer)
+
+    assert switcher.sync_live_to_slot(store) == 1
+
+    assert json.loads(slot_auth.read_text("utf-8")) == newer
+
+
+def test_sync_back_refuses_a_live_file_that_still_names_the_account(codex_root):
+    """The dangerous shape: it identifies slot 1, so a missing check would overwrite it."""
+    store = _two_accounts()
+    slot_auth = store.path_for(paths.slot_auth_path(1))
+    before = slot_auth.read_bytes()
+    useless = _strip_usable_tokens(make_auth(email="one@example.com", account_id="acct-1"))
+    useless["last_refresh"] = "2099-01-01T00:00:00.000000000Z"
+    paths.atomic_write_json(paths.live_auth_path(), useless)
+
+    assert switcher.sync_live_to_slot(store) is None
+
+    assert slot_auth.read_bytes() == before

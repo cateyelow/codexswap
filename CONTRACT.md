@@ -1152,5 +1152,27 @@ in the credential export. Forced import preserves an existing destination config
 - `render`: no ANSI when colour is disabled, duration and timestamp formatting.
 - `cli`: argument parsing for every subcommand, exit codes for each error class, and
   `--json` shapes matching section 9.
+- `unclaimed`: what a rescue keeps and what it refuses, that a listing never carries
+  the credential, that `--claim` drops the copy only after the registry holds it, and
+  that an id cannot name a file outside the stash.
+
+Coverage is judged by whether a test would fail if the behaviour were removed, not by
+whether the line executed. Every rule that guards something irreversible needs a test
+that reaches it through the real call path -- a test that constructs the guard
+directly still passes when a caller stops using it. The suite carries paired tests for
+these, each with the control case that proves the guard rejects the wrong thing rather
+than everything:
+
+- a confirmed `purge` refuses each way its root can overlap the Codex home, and
+  deletes a root that overlaps neither;
+- sync-back keeps a slot credential newer than the live one, and adopts a newer live
+  one; and refuses a live file that identifies the slot but cannot authenticate;
+- a forced import validates every entry before writing any;
+- two stale registries each register their own account;
+- an unreadable redemption ledger stays unspendable across a daemon save;
+- a running daemon adopts `reset.policy never` set between ticks;
+- a backend fallback reading for another account cannot authorise a redemption;
+- a real backend request goes through the redirect guard, not just the guard class;
+- `add-token` never echoes the key, including under `--debug`.
 
 Target: the suite runs in under 30 seconds on Windows.

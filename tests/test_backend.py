@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import email
 import errno
+import io
 import json
 import os
 import socket
@@ -10,6 +12,7 @@ import sysconfig
 import threading
 import time
 import urllib.request
+import urllib.response
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -525,3 +528,61 @@ def test_a_redirect_within_the_same_origin_is_allowed():
         request, None, 302, "Found", {}, "https://chatgpt.example/backend-api/other")
 
     assert followed is not None
+
+
+def _canned(body: bytes, header_text: str, url: str, code: int):
+    """An addinfourl shaped the way urllib's own handlers expect one."""
+    response = urllib.response.addinfourl(
+        io.BytesIO(body), email.message_from_string(header_text), url, code)
+    response.msg = "Canned"
+    return response
+
+
+def test_a_real_request_goes_through_the_redirect_guard(monkeypatch):
+    """A test on the handler alone would pass with an unguarded opener in _request."""
+    attempts = []
+
+    class Handler(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def https_open(self, req):
+            attempts.append(req.full_url)
+            return _canned(b"", "Location: https://evil.example.com/steal\n",
+                           req.full_url, 302)
+
+        http_open = https_open
+
+    monkeypatch.setattr(backend, "BASE_URL", "https://chatgpt.example/backend-api")
+    monkeypatch.setattr(backend, "_OPENER",
+                        urllib.request.build_opener(backend._SameOriginRedirects, Handler))
+
+    with pytest.raises(errors.BackendError, match="refusing to forward credentials"):
+        backend._request("/wham/usage", "at.TESTONLY", "acct-1", timeout=1)
+
+    assert attempts == ["https://chatgpt.example/backend-api/wham/usage"], (
+        "the credential must not be sent a second time")
+
+
+def test_a_same_origin_redirect_on_the_real_path_is_followed(monkeypatch):
+    """The control: the guard refuses a move, not every redirect."""
+    attempts = []
+
+    class Handler(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def https_open(self, req):
+            attempts.append(req.full_url)
+            if len(attempts) == 1:
+                return _canned(
+                    b"", "Location: https://chatgpt.example/backend-api/wham/usage2\n",
+                    req.full_url, 302)
+            return _canned(b'{"ok": true}', "", req.full_url, 200)
+
+        http_open = https_open
+
+    monkeypatch.setattr(backend, "BASE_URL", "https://chatgpt.example/backend-api")
+    monkeypatch.setattr(backend, "_OPENER",
+                        urllib.request.build_opener(backend._SameOriginRedirects, Handler))
+
+    assert backend._request("/wham/usage", "at.TESTONLY", "acct-1", timeout=1) == {"ok": True}
+    assert len(attempts) == 2

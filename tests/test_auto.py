@@ -8,7 +8,7 @@ from datetime import datetime
 import pytest
 from conftest import RATE_LIMITS_RESULT, make_auth
 
-from codexswap import auto, errors
+from codexswap import appserver, auto, errors, resets, switcher
 from codexswap.models import PerLimitUsage, RateLimitWindow, UsageSnapshot
 from codexswap.settings import Settings
 from codexswap.store import AccountStore
@@ -640,3 +640,115 @@ def test_an_ordinary_run_still_quarantines_a_corrupt_registry(swap_home):
 
     assert not registry.exists()
     assert len(list(swap_home.glob("accounts.json.corrupt-*"))) == 1
+
+
+def test_a_successful_automatic_redemption_drops_that_slot_cached_usage(scenario):
+    """Both windows are now zero, so every cached number for the slot is wrong."""
+    scenario.store.record_usage(1, usage(96))
+    scenario.store.record_usage(2, usage(20))
+    scenario.settings.set("reset.policy", "always")
+    scenario.settings.set("reset.minUsagePercent", "50")
+    scenario.snapshots[1] = usage(96)
+
+    assert scenario.tick(now=NOW).action == "redeemed"
+
+    reloaded = AccountStore.load()
+    assert "1" not in reloaded.read_usage_cache()
+    assert "2" in reloaded.read_usage_cache(), "only the redeemed slot is dropped"
+    assert reloaded.get(1).last_seen_usage is None
+    assert reloaded.get(1).last_seen_at is None
+
+
+def test_a_failed_automatic_redemption_leaves_the_cache_alone(scenario):
+    scenario.store.record_usage(1, usage(96))
+    scenario.settings.set("reset.policy", "always")
+    scenario.snapshots[1] = usage(96)
+    scenario.outcome = "noCredit"
+
+    scenario.tick(now=NOW)
+
+    assert "1" in AccountStore.load().read_usage_cache()
+
+
+@pytest.mark.parametrize("alternative,label", [(75, "below threshold, above hysteresis"),
+                                               (None, "usage unknown")])
+def test_exhausted_counts_headroom_by_the_plain_threshold(scenario, alternative, label):
+    """Hysteresis governs switching, not whether an irreversible spend is needed."""
+    scenario.settings.set("reset.policy", "exhausted")
+    scenario.settings.set("autoswitch.threshold", "80")
+    scenario.settings.set("autoswitch.hysteresisPct", "10")
+    scenario.settings.set("reset.minUsagePercent", "50")
+    scenario.snapshots[1] = usage(99)
+    scenario.snapshots[2] = (usage(alternative) if alternative is not None
+                             else replace(usage(0), primary=None, secondary=None))
+
+    result = scenario.tick(now=NOW)
+
+    assert scenario.redeemed == [], label
+    assert result.action != "redeemed", label
+
+
+def test_exhausted_still_redeems_when_no_alternative_has_headroom(scenario):
+    """The control: an alternative over the threshold really is no headroom."""
+    scenario.settings.set("reset.policy", "exhausted")
+    scenario.settings.set("reset.minUsagePercent", "50")
+    scenario.snapshots[1] = usage(99)
+    scenario.snapshots[2] = usage(97)
+
+    assert scenario.tick(now=NOW).action == "redeemed"
+    assert [slot for slot, _ in scenario.redeemed] == [1]
+
+
+def test_the_daemon_rejects_a_cached_alternative_that_names_another_account(scenario):
+    """A foreign cached reading must not be the evidence that everyone is exhausted."""
+    foreign = replace(usage(99), account_id="acct-somebody-else")
+    scenario.store.record_usage(2, foreign)
+    accounts = auto._AutoAccounts(scenario.store, scenario.settings, NOW)
+
+    assert accounts.cached_usage(2, max_age=999999, now=NOW) is None
+    mine = replace(usage(20), account_id="acct-2")
+    scenario.store.record_usage(2, mine)
+    assert auto._AutoAccounts(
+        scenario.store, scenario.settings, NOW,
+    ).cached_usage(2, max_age=999999, now=NOW) is not None
+
+
+def test_a_running_daemon_adopts_a_reset_policy_disabled_between_ticks(
+    swap_home, monkeypatch,
+):
+    """`config set reset.policy never` must stop the next tick, not the next process."""
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="one@example.com", account_id="acct-1"), now=NOW)
+    store.set_active(1)
+    settings = Settings.load()
+    settings.set("reset.policy", "always")
+    settings.set("reset.minUsagePercent", "0")
+    settings.set("autoswitch.intervalSeconds", "10")
+    # Nothing but the policy may stop the second tick.
+    settings.set("autoswitch.cooldownSeconds", "0")
+    settings.set("reset.maxPerDay", "0")
+    settings.save()
+    redeemed = []
+    monkeypatch.setattr(resets, "redeem",
+                        lambda *a, **k: redeemed.append(k.get("credit_id")) or "reset")
+    monkeypatch.setattr(appserver, "probe_usage",
+                        lambda home, timeout=None: replace(usage(99), account_id="acct-1"))
+    monkeypatch.setattr(switcher, "activate", lambda *a, **k: None)
+    ticks = []
+
+    def sleep(_seconds):
+        ticks.append(len(ticks))
+        if len(ticks) == 1:
+            # Someone runs `codexswap config set reset.policy never` right here.
+            fresh = Settings.load()
+            fresh.set("reset.policy", "never")
+            fresh.save()
+        if len(ticks) >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(auto.time, "sleep", sleep)
+
+    assert auto.run(log=lambda line: None) == 0
+
+    assert len(ticks) == 2, "the loop really did run twice"
+    assert len(redeemed) == 1, "the first tick redeemed; the second must not"

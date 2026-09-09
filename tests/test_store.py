@@ -328,3 +328,53 @@ def test_an_email_naming_two_slots_is_ambiguous_rather_than_the_first():
 
     with pytest.raises(errors.UserError, match="Ambiguous account email"):
         AccountStore.load().resolve("person1@example.com")
+
+
+def test_readding_refuses_a_credential_that_identifies_a_slot_but_cannot_authenticate():
+    """The dangerous shape: it matches slot 1 by identity, so it would overwrite it."""
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="a@example.com", account_id="acct-a"))
+    slot_auth = paths.slot_auth_path(1)
+    before = slot_auth.read_bytes()
+    identified_but_useless = make_auth(email="a@example.com", account_id="acct-a")
+    identified_but_useless["tokens"]["access_token"] = ""
+    identified_but_useless["tokens"]["refresh_token"] = ""
+
+    with pytest.raises(errors.AuthFileInvalid):
+        store.add_from_auth(identified_but_useless)
+
+    assert slot_auth.read_bytes() == before
+    assert list(AccountStore.load().accounts) == [1]
+    assert AccountStore.load().get(1).identity.account_id == "acct-a"
+
+
+def test_two_stale_stores_each_register_their_own_account(swap_home):
+    """Both loaded before either wrote, so both believe slot 1 is free."""
+    first = AccountStore.load()
+    second = AccountStore.load()
+
+    a = first.add_from_auth(make_auth(email="a@example.com", account_id="acct-a"))
+    b = second.add_from_auth(make_auth(email="b@example.com", account_id="acct-b"))
+
+    assert a.slot != b.slot
+    reloaded = AccountStore.load()
+    assert sorted(reloaded.accounts) == sorted([a.slot, b.slot])
+    assert {account.identity.email for account in reloaded.ordered()} == {
+        "a@example.com", "b@example.com"}
+    for slot, account_id in ((a.slot, "acct-a"), (b.slot, "acct-b")):
+        stored = json.loads(paths.slot_auth_path(slot).read_text("utf-8"))
+        assert stored["tokens"]["account_id"] == account_id
+
+
+def test_a_stale_store_registering_an_api_key_does_not_erase_an_oauth_account(swap_home):
+    first = AccountStore.load()
+    second = AccountStore.load()
+
+    a = first.add_from_auth(make_auth(email="a@example.com", account_id="acct-a"))
+    b = second.add_token("sk-second-key", email="key@example.com")
+
+    assert a.slot != b.slot
+    reloaded = AccountStore.load()
+    assert sorted(reloaded.accounts) == sorted([a.slot, b.slot])
+    assert json.loads(
+        paths.slot_auth_path(a.slot).read_text("utf-8"))["tokens"]["account_id"] == "acct-a"

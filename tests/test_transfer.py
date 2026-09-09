@@ -220,3 +220,32 @@ def test_export_skips_an_unreadable_slot_and_keeps_the_rest(swap_home, capsys):
     assert "skipping slot 2" in capsys.readouterr().err
     archived = json.loads(path.read_text(encoding="utf-8"))
     assert [entry["slot"] for entry in archived["accounts"]] == [1]
+
+
+def test_a_forced_import_validates_every_entry_before_writing_any(swap_home, capsys):
+    """A bad second entry must not cost the credential the good first entry replaced."""
+    store = AccountStore.load(swap_home)
+    store.add_from_auth(make_auth(email="original@example.com", account_id="acct-original"))
+    slot_auth = swap_home / "homes" / "1" / "auth.json"
+    before = slot_auth.read_bytes()
+    broken = make_auth(email="broken@example.com", account_id="acct-broken")
+    broken["tokens"]["access_token"] = ""
+    broken["tokens"]["refresh_token"] = ""
+    archive = swap_home / "mixed.json"
+    archive.write_text(json.dumps({
+        "format": "codexswap-export", "version": 1, "accounts": [
+            # Entry 1 is valid and targets the occupied slot: with --force it would be
+            # written first by an implementation that validated as it went.
+            {"slot": 1, "auth": make_auth(email="replacement@example.com",
+                                          account_id="acct-replacement")},
+            {"slot": 2, "auth": broken},
+        ]}), encoding="utf-8")
+
+    with pytest.raises(errors.AuthFileInvalid):
+        transfer.import_accounts(store, archive, force=True)
+
+    assert slot_auth.read_bytes() == before
+    reloaded = AccountStore.load(swap_home)
+    assert list(reloaded.accounts) == [1]
+    assert reloaded.get(1).identity.email == "original@example.com"
+    assert not (swap_home / "homes" / "2").exists()

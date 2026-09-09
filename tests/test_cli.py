@@ -509,3 +509,115 @@ def test_an_unparseable_slot_credential_is_not_reported_healthy(swap_home, capsy
 
     assert cli.main(["list", "--json", "--no-probe"]) == 0
     assert json.loads(capsys.readouterr().out)["accounts"][0]["health"] == "unknown"
+
+
+@pytest.mark.parametrize("relation", ["same", "ancestor", "descendant", "home-dot-codex"])
+def test_a_confirmed_purge_refuses_to_delete_the_codex_home(
+    tmp_path, monkeypatch, capsys, relation,
+):
+    """`--yes` is the only path that reaches rmtree, so it is the one that must refuse."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".codex").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    live = tmp_path / "live-codex"
+    live.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(live))
+    root = {
+        "same": live,
+        "ancestor": tmp_path,
+        "descendant": live / "inside",
+        "home-dot-codex": fake_home / ".codex" / "nested",
+    }[relation]
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CODEXSWAP_HOME", str(root))
+    deleted = []
+    monkeypatch.setattr(cli.shutil, "rmtree", lambda path, **kw: deleted.append(path))
+
+    assert cli.main(["purge", "--yes"]) == 2
+
+    assert deleted == []
+    assert "overlapping the Codex home" in capsys.readouterr().err
+    assert live.is_dir()
+
+
+def test_a_confirmed_purge_deletes_the_root_it_was_pointed_at(tmp_path, monkeypatch, capsys):
+    """The control: a root that overlaps nothing really is deleted."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".codex").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    live = tmp_path / "live-codex"
+    live.mkdir()
+    root = tmp_path / "swap"
+    root.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(live))
+    monkeypatch.setenv("CODEXSWAP_HOME", str(root))
+    deleted = []
+    monkeypatch.setattr(cli.shutil, "rmtree", lambda path, **kw: deleted.append(path))
+
+    assert cli.main(["purge", "--yes"]) == 0
+
+    assert deleted == [root.resolve()]
+    assert live.is_dir() and (fake_home / ".codex").is_dir()
+
+
+def test_a_backend_reading_for_another_account_cannot_authorise_a_redemption(
+    seeded_store, monkeypatch, capsys,
+):
+    """The fallback path needs the same identity guard the app-server path has."""
+    from codexswap import backend
+
+    foreign = replace(UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW),
+                      account_id="acct-somebody-else")
+    monkeypatch.setattr(appserver, "probe_usage", _failing_probe)
+    monkeypatch.setattr(backend, "probe_usage", lambda home, *, timeout: foreign)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a mismatched reading must not reach a redemption")
+
+    monkeypatch.setattr(resets, "redeem", forbidden)
+    assert cli.main(["config", "set", "probe.allowBackendFallback", "true"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["reset", "use", "--yes"]) == 2
+
+    assert "different account" in capsys.readouterr().err
+    reloaded = AccountStore.load()
+    assert reloaded.get(1).identity.account_id == "acct-0000-1111"
+    cached = reloaded.read_usage_cache().get("1")
+    assert cached is None or cached.get("accountId") != "acct-somebody-else"
+
+
+def test_a_matching_backend_reading_still_authorises_a_redemption(
+    seeded_store, monkeypatch, capsys,
+):
+    """The control: the guard rejects the wrong account, not the fallback itself."""
+    from codexswap import backend
+
+    mine = replace(UsageSnapshot.from_api(RATE_LIMITS_RESULT, fetched_at=NOW),
+                   account_id="acct-0000-1111")
+    monkeypatch.setattr(appserver, "probe_usage", _failing_probe)
+    monkeypatch.setattr(backend, "probe_usage", lambda home, *, timeout: mine)
+    monkeypatch.setattr(resets, "redeem", lambda *a, **k: "reset")
+    assert cli.main(["config", "set", "probe.allowBackendFallback", "true"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["reset", "use", "--yes"]) == 0
+    assert "reset slot 1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("debug", [[], ["--debug"]])
+def test_an_unexpected_add_token_failure_never_echoes_the_key(monkeypatch, capsys, debug):
+    """--debug prints a traceback, and a traceback prints the arguments in it."""
+    secret = "sk-not-a-real-key-8f3c1d9e"
+
+    def explode(self, token, **kwargs):
+        raise RuntimeError(f"backend refused {token}")
+
+    monkeypatch.setattr(AccountStore, "add_token", explode)
+
+    assert cli.main([*debug, "add-token", secret]) != 0
+
+    captured = capsys.readouterr()
+    for stream in (captured.out, captured.err):
+        assert secret not in stream
+        assert "8f3c1d9e" not in stream
