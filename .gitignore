@@ -11,3 +11,20 @@ venv/
 .coverage
 htmlcov/
 *.log
+
+# Never commit a credential or a live codexswap home. These are the exact names the
+# tool writes; an export can be called anything, so keep those outside the checkout.
+.env
+.env.*
+!.env.example
+auth.json
+auth.json.*
+.codex/
+.codexswap/
+/homes/
+/accounts.json
+/settings.json
+/state.json
+/usage-cache.json
+/mappings.json
+*.codexswap-export.json

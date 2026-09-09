@@ -37,6 +37,7 @@ jobs:
       - name: Smoke test the installed console script
         env:
           CODEXSWAP_HOME: ${{ runner.temp }}/codexswap-smoke
+          CODEX_HOME: ${{ runner.temp }}/codex-smoke
         run: |
           codexswap --help
           codexswap version
@@ -54,6 +55,26 @@ jobs:
         run: pip install build
       - name: Build distributions
         run: python -m build
+      - name: Check distribution metadata
+        # Catch a metadata regression on the pull request, not on the release tag
+        # where the version number has already been burned.
+        run: |
+          pip install "twine>=6.1"
+          python -m twine check --strict dist/*
+      - name: Smoke test the built wheel, outside the checkout
+        env:
+          CODEXSWAP_HOME: ${{ runner.temp }}/codexswap-wheel
+          CODEX_HOME: ${{ runner.temp }}/codex-wheel
+        # The matrix installs the checkout, so it would still pass if a module went
+        # missing from the wheel. This installs what users actually get.
+        run: |
+          python -m venv "${{ runner.temp }}/wheelenv"
+          "${{ runner.temp }}/wheelenv/bin/pip" install --no-index --no-deps dist/*.whl
+          cd "${{ runner.temp }}"
+          "${{ runner.temp }}/wheelenv/bin/codexswap" --help
+          "${{ runner.temp }}/wheelenv/bin/codexswap" version
+          "${{ runner.temp }}/wheelenv/bin/codexswap" list --no-probe
+          "${{ runner.temp }}/wheelenv/bin/cxswap" config
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:

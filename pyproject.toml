@@ -1,5 +1,6 @@
 [build-system]
-requires = ["hatchling"]
+# PEP 639 `license = "MIT"` needs hatchling 1.27 or newer.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,14 +8,16 @@ name = "codexswap"
 dynamic = ["version"]
 description = "Multi-account switcher and banked rate-limit reset manager for OpenAI Codex CLI"
 readme = "README.md"
-license = { file = "LICENSE" }
+# PEP 639: an SPDX expression, not the file inlined into a metadata header.
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "cateyelow" }]
 requires-python = ">=3.9"
 keywords = ["codex", "openai", "cli", "account", "switcher", "rate-limit"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",

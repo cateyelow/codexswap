@@ -21,7 +21,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, TextIO, Union
 
-from . import paths, redaction
+from . import __version__, paths, redaction
 from .errors import AppServerError, AppServerTimeout, AuthExpired, CodexBinaryNotFound
 from .models import UsageSnapshot
 
@@ -113,7 +113,7 @@ class AppServerClient:
         timeout: float = 45.0,
         codex_bin: Optional[Union[str, List[str]]] = None,
         client_name: str = "codexswap",
-        client_version: str = "0.1.0",
+        client_version: str = __version__,
     ) -> None:
         self.codex_home = Path(codex_home)
         self.timeout = timeout
