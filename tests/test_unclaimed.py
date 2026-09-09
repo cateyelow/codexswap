@@ -247,14 +247,19 @@ def test_an_unknown_id_names_what_is_actually_stashed(swap_home, capsys):
         assert entry_id in capsys.readouterr().err
 
 
+def _doctor_checks(capsys):
+    """Doctor's own exit code depends on whether Codex is installed, which is not
+    what these assertions are about; the report is printed either way."""
+    cli.main(["doctor", "--json"])
+    return {check["name"]: check for check in json.loads(capsys.readouterr().out)["checks"]}
+
+
 def test_doctor_reports_a_rescued_credential(swap_home, capsys):
-    assert cli.main(["doctor", "--json"]) == 0
-    quiet = {check["name"]: check for check in json.loads(capsys.readouterr().out)["checks"]}
+    quiet = _doctor_checks(capsys)
     assert quiet["unclaimed"]["status"] == "ok"
 
     entry_id = _stash_one()
-    assert cli.main(["doctor", "--json"]) == 0
-    loud = {check["name"]: check for check in json.loads(capsys.readouterr().out)["checks"]}
+    loud = _doctor_checks(capsys)
     assert loud["unclaimed"]["status"] == "warn"
     assert entry_id in loud["unclaimed"]["detail"]
     assert "codexswap unclaimed" in loud["unclaimed"]["detail"]

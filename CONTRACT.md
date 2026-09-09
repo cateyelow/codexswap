@@ -1135,7 +1135,15 @@ in the credential export. Forced import preserves an existing destination config
 ## 12. Testing requirements
 
 `pytest`, no network, no real Codex binary. Every test sets `CODEXSWAP_HOME` to a
-`tmp_path` via a fixture. Required coverage:
+`tmp_path` via a fixture.
+
+CI runners have no Codex installed and a developer machine does, so a test must never
+assume one is on `PATH`. `doctor` is the trap: it exits 1 when it cannot find the
+binary, so asserting `doctor` returns 0 passes locally and fails in CI. Fake the
+binary where the test is about it, and ignore the exit code where it is not. Running
+the suite with Codex removed from `PATH` reproduces the CI environment.
+
+Required coverage:
 
 - `identity`: JWT decode including padding edge cases, missing claims, apikey mode,
   malformed base64 raising `AuthFileInvalid`.
