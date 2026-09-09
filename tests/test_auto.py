@@ -618,3 +618,25 @@ def test_an_exhausted_alternative_still_permits_the_exhausted_policy(scenario):
 
     assert result.action == "redeemed"
     assert [slot for slot, _ in scenario.redeemed] == [1]
+
+
+def test_a_dry_run_does_not_rename_a_corrupt_registry(swap_home, capsys):
+    """`--dry-run` promises to write nothing, and quarantining is a write."""
+    registry = swap_home / "accounts.json"
+    registry.write_text('{"version": 1, "accounts": "not a list"}', encoding="utf-8")
+
+    assert auto.run(once=True, dry_run=True, log=lambda line: None) == 0
+
+    assert registry.read_text(encoding="utf-8") == '{"version": 1, "accounts": "not a list"}'
+    assert list(swap_home.glob("accounts.json.corrupt-*")) == []
+    assert "corrupt accounts.json" in capsys.readouterr().err
+
+
+def test_an_ordinary_run_still_quarantines_a_corrupt_registry(swap_home):
+    registry = swap_home / "accounts.json"
+    registry.write_text('{"version": 1, "accounts": "not a list"}', encoding="utf-8")
+
+    assert auto.run(once=True, log=lambda line: None) == 0
+
+    assert not registry.exists()
+    assert len(list(swap_home.glob("accounts.json.corrupt-*"))) == 1

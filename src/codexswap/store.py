@@ -36,7 +36,12 @@ class AccountStore:
         return self._root / default.relative_to(paths.codexswap_home())
 
     @classmethod
-    def load(cls, root: Optional[Path] = None) -> AccountStore:
+    def load(cls, root: Optional[Path] = None, *, quarantine: bool = True) -> AccountStore:
+        """Read the registry. `quarantine=False` for callers that must not write.
+
+        A corrupt registry is normally renamed aside so the next command starts from
+        a clean file. That is a write, and `auto --dry-run` promises to make none.
+        """
         store = cls(root)
         registry = store.path_for(paths.accounts_path())
         try:
@@ -61,9 +66,13 @@ class AccountStore:
                 raise ValueError("Invalid active slot")
             store.active_slot = active
         except (ValueError, TypeError, KeyError, AttributeError):
-            paths.quarantine_corrupt(registry)
-            print("warning: corrupt accounts.json was quarantined; loaded an empty store",
-                  file=sys.stderr)
+            if quarantine:
+                paths.quarantine_corrupt(registry)
+                print("warning: corrupt accounts.json was quarantined; loaded an empty store",
+                      file=sys.stderr)
+            else:
+                print("warning: corrupt accounts.json; reading it as an empty store",
+                      file=sys.stderr)
             store.accounts = {}
             store.active_slot = None
         return store

@@ -205,3 +205,18 @@ def test_export_file_is_private_on_posix(populated_store, tmp_path):
     transfer.export_accounts(store, path)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_export_skips_an_unreadable_slot_and_keeps_the_rest(swap_home, capsys):
+    """One damaged slot must not cost the user a backup of the others."""
+    store = AccountStore.load(swap_home)
+    store.add_from_auth(make_auth(email="good@example.com", account_id="acct-good"))
+    store.add_from_auth(make_auth(email="broken@example.com", account_id="acct-broken"))
+    (swap_home / "homes" / "2" / "auth.json").write_text("{ truncated", encoding="utf-8")
+    path = swap_home / "partial.json"
+
+    assert transfer.export_accounts(store, path) == 1
+
+    assert "skipping slot 2" in capsys.readouterr().err
+    archived = json.loads(path.read_text(encoding="utf-8"))
+    assert [entry["slot"] for entry in archived["accounts"]] == [1]

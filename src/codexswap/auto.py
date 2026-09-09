@@ -529,7 +529,9 @@ def run(
                 # Reload both so `config set` and external switches take effect in a
                 # running daemon; a stale policy would keep spending reset credits.
                 settings = overrides(Settings.load())
-                store = AccountStore.load()
+                # A dry run reports what would happen and writes nothing, so it
+                # must not rename a corrupt registry aside either.
+                store = AccountStore.load(quarantine=not dry_run)
                 # Reload state too: the daily cap is shared with any other process
                 # using this home, and its history lives only in state.json.
                 state = AutoState.load()

@@ -122,10 +122,19 @@ class RateLimitWindow:
         )
 
     @classmethod
-    def from_api(cls, d: Any) -> RateLimitWindow:
+    def from_api(cls, d: Any) -> Optional[RateLimitWindow]:
+        """A window, or None when the payload does not actually report a figure.
+
+        `usedPercent` absent and `usedPercent: 0` are different answers. Collapsing
+        them reports an exhausted account as fresh, which is exactly the direction
+        that picks the wrong account to switch to.
+        """
         d = _mapping(d)
+        used = _optional_float(d.get("usedPercent"))
+        if used is None:
+            return None
         return cls(
-            used_percent=_optional_float(d.get("usedPercent")) or 0.0,
+            used_percent=used,
             window_minutes=_optional_int(d.get("windowDurationMins")) or 0,
             resets_at=_optional_int(d.get("resetsAt")),
         )

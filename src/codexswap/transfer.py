@@ -22,9 +22,12 @@ def export_accounts(
         for account in accounts:
             try:
                 auth = identity.load_auth(store.path_for(paths.slot_auth_path(account.slot)))
-            except errors.AuthFileMissing:
-                print(f"warning: skipping slot {account.slot} because its auth file is missing",
-                      file=sys.stderr)
+            except (errors.AuthFileMissing, errors.AuthFileInvalid, OSError):
+                # One damaged slot must not cost the user a backup of the others.
+                # The caller reports the shortfall so a partial archive is never
+                # mistaken for a complete one.
+                print(f"warning: skipping slot {account.slot}: its auth file is missing "
+                      "or cannot be read", file=sys.stderr)
                 continue
             entries.append({"slot": account.slot, "email": account.identity.email,
                             "alias": account.alias, "disabled": account.disabled, "auth": auth})

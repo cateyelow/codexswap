@@ -485,3 +485,27 @@ def test_a_cached_snapshot_from_another_account_is_not_shown(seeded_store, capsy
     captured = capsys.readouterr()
     assert json.loads(captured.out)["accounts"][0]["usage"] is None
     assert captured.err == ""
+
+
+def test_a_slot_whose_credential_is_gone_is_not_reported_healthy(swap_home, capsys):
+    """The registry's identity outlives the file it was read from."""
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="gone@example.com", account_id="acct-gone"))
+    (paths.slot_home(1) / "auth.json").unlink()
+
+    assert cli.main(["list", "--json", "--no-probe"]) == 0
+    entry = json.loads(capsys.readouterr().out)["accounts"][0]
+    assert entry["health"] == "unknown"
+    assert entry["email"] == "gone@example.com", "the account is still listed"
+
+    assert cli.main(["list", "--no-probe", "--no-color"]) == 0
+    assert "stored credential could not be read" in capsys.readouterr().out
+
+
+def test_an_unparseable_slot_credential_is_not_reported_healthy(swap_home, capsys):
+    store = AccountStore.load()
+    store.add_from_auth(make_auth(email="broken@example.com", account_id="acct-broken"))
+    (paths.slot_home(1) / "auth.json").write_text("{ truncated", encoding="utf-8")
+
+    assert cli.main(["list", "--json", "--no-probe"]) == 0
+    assert json.loads(capsys.readouterr().out)["accounts"][0]["health"] == "unknown"

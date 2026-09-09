@@ -353,3 +353,19 @@ def test_describes_only_rejects_two_known_and_different_ids(probed, registered, 
 def test_the_verified_payload_describes_the_account_it_came_from():
     assert snapshot().describes(_identity("acct-0000-1111")) is True
     assert snapshot().describes(_identity("acct-somebody-else")) is False
+
+
+def test_a_window_that_reports_no_percentage_is_unknown_not_zero():
+    """Absent and zero are different answers; collapsing them reports full as fresh."""
+    assert models.RateLimitWindow.from_api({}) is None
+    assert models.RateLimitWindow.from_api({"windowDurationMins": 300}) is None
+    assert models.RateLimitWindow.from_api({"usedPercent": None}) is None
+    zero = models.RateLimitWindow.from_api({"usedPercent": 0, "windowDurationMins": 300})
+    assert zero is not None and zero.used_percent == 0.0
+
+
+def test_an_empty_window_object_leaves_usage_unknown():
+    snapshot = models.UsageSnapshot.from_api(
+        {"rateLimits": {"primary": {}, "secondary": {}}}, fetched_at=NOW)
+    assert snapshot.primary is None and snapshot.secondary is None
+    assert snapshot.binding_percent is None

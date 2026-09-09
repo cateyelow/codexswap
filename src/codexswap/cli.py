@@ -359,15 +359,22 @@ def _show_accounts(args, store, settings, color):
               "run: codexswap doctor".format(", ".join(str(slot) for slot in sorted(mismatched))),
               file=sys.stderr)
     for account in accounts:
-        # A missing or unreadable slot file must not prevent listing the stored account.
-        with contextlib.suppress(errors.CodexSwapError, OSError):
+        # A missing or unreadable slot file must not prevent listing the stored
+        # account, and must not let it be shown as healthy either. The registry's copy
+        # of the identity outlives the file it was read from, so reporting that copy
+        # unchanged says "ok" about a credential that is no longer there.
+        try:
             derived = identity_from_auth(
                 load_auth(paths.slot_home(account.slot) / "auth.json")
             )
-            if derived.auth_mode == "apikey":
-                derived = replace(derived, email=account.identity.email, plan_type="api key")
-                usages[account.slot] = (None, False)
-            account.identity = derived
+        except (errors.CodexSwapError, OSError):
+            account.identity = replace(account.identity, auth_mode="unknown",
+                                       access_token_exp=None, id_token_exp=None)
+            continue
+        if derived.auth_mode == "apikey":
+            derived = replace(derived, email=account.identity.email, plan_type="api key")
+            usages[account.slot] = (None, False)
+        account.identity = derived
     if args.json:
         entries = [_json_account(account, *usages[account.slot], active_slot=store.active_slot,
                                  auth_failed=auth_failed)
