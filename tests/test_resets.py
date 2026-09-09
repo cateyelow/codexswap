@@ -6,9 +6,9 @@ from dataclasses import replace
 from unittest.mock import MagicMock, Mock
 
 import pytest
-from conftest import RATE_LIMITS_RESULT
+from conftest import RATE_LIMITS_RESULT, make_auth
 
-from codexswap import resets
+from codexswap import errors, resets
 from codexswap.models import UsageSnapshot
 from codexswap.settings import Settings
 
@@ -293,3 +293,64 @@ def test_describe_is_nonempty_and_never_exposes_credit_id(soonest, reason, shoul
     assert description.strip()
     assert soonest.id not in description
     assert "RateLimitResetCredit_" not in description
+
+
+def _slot_home(tmp_path, auth):
+    home = tmp_path / "slot"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text(json.dumps(auth), encoding="utf-8")
+    return home
+
+
+def test_redeem_refuses_when_the_slot_now_holds_another_account(tmp_path):
+    home = _slot_home(tmp_path, make_auth(email="b@example.com", account_id="acct-b"))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the app-server must not be reached")
+
+    with pytest.raises(errors.UserError, match="different account"):
+        resets.redeem(home, credit_id="c1", expect_account_id="acct-a",
+                      client_factory=forbidden)
+
+
+def test_redeem_proceeds_when_the_account_still_matches(tmp_path):
+    home = _slot_home(tmp_path, make_auth(email="a@example.com", account_id="acct-a"))
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def consume_reset_credit(self, key, credit_id=None):
+            return "reset"
+
+    outcome = resets.redeem(home, credit_id="c1", expect_account_id="acct-a",
+                            client_factory=Client)
+
+    assert outcome == "reset"
+
+
+def test_redeem_without_an_expected_account_does_not_read_the_slot(tmp_path):
+    home = tmp_path / "empty"
+    home.mkdir()
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def consume_reset_credit(self, key, credit_id=None):
+            return "reset"
+
+    # No auth.json at all, and no cross-check requested: the call still goes out.
+    assert resets.redeem(home, credit_id="c1", client_factory=Client) == "reset"

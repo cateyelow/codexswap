@@ -20,6 +20,9 @@ from .store import AccountStore
 
 _logger = logging.getLogger(__name__)
 _DAY = 86400
+# Stands in for a slot with no reading, so the redeemer can ask for an account
+# id without branching. No id means no cross-check, which is the old behaviour.
+_NO_SNAPSHOT = UsageSnapshot.from_api({}, fetched_at=0.0)
 _MAX_LOG_BYTES = 2 * 1024 * 1024
 # Outcomes that prove the credit was NOT spent. Every other value, including a
 # crashed attempt left as "pending", counts against the cap: there is no proof.
@@ -506,9 +509,11 @@ def run(
                     journal=RedemptionJournal(state, persist=not dry_run),
                     redeemer=lambda account, credit_id, store=store, timeout=(
                         settings.probe_timeout
-                    ): resets.redeem(
+                    ), accounts=accounts: resets.redeem(
                         store.path_for(paths.slot_home(account.slot)),
                         credit_id=credit_id, timeout=timeout,
+                        expect_account_id=accounts.readings.get(
+                            account.slot, _NO_SNAPSHOT).account_id,
                     ),
                     activator=lambda account, store=store: switcher.activate(
                         # The unattended daemon must switch while Codex is running.

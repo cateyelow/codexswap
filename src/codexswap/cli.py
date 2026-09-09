@@ -486,8 +486,9 @@ def _reset(args, store, settings, color):
                 _print_json({"slot": account.slot, "creditId": credit.id,
                              "outcome": None, "dryRun": False})
             return 0
-    outcome = resets.redeem(paths.slot_home(account.slot), credit_id=credit.id,
-                            timeout=settings.probe_timeout)
+    outcome = resets.redeem(store.path_for(paths.slot_home(account.slot)),
+                            credit_id=credit.id, timeout=settings.probe_timeout,
+                            expect_account_id=snapshot.account_id)
     if resets.outcome_is_success(outcome):
         # Both windows are now zero and one credit is gone. Every cached number for
         # this slot is wrong, not merely stale, so the next read must probe again.

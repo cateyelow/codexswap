@@ -68,14 +68,33 @@ def decide(
 def redeem(
     codex_home: Path, *, credit_id: Optional[str] = None,
     idempotency_key: Optional[str] = None, timeout: float = 45.0,
+    expect_account_id: Optional[str] = None,
     client_factory=None,
 ) -> str:
+    """Spend one credit. Irreversible, so the account is checked one last time.
+
+    The usage read and this call open separate app-server sessions against a slot
+    directory anything can write to in between. `expect_account_id` is the account
+    the decision was made about; if the credential in the home now belongs to
+    somebody else, the credit would come out of their balance.
+    """
     if client_factory is None:
         from .appserver import AppServerClient
 
         client_factory = AppServerClient
     if idempotency_key is None:
         idempotency_key = str(uuid.uuid4())
+    if expect_account_id:
+        from . import errors, identity
+
+        found = identity.identity_from_auth(
+            identity.load_auth(Path(codex_home) / "auth.json")
+        ).account_id
+        if found and found != expect_account_id:
+            raise errors.UserError(
+                "The credential in this slot changed while the decision was being "
+                "made; refusing to redeem against a different account"
+            )
     with client_factory(codex_home, timeout=timeout) as client:
         return client.consume_reset_credit(idempotency_key, credit_id=credit_id)
 
