@@ -22,11 +22,18 @@ the simplest behaviour consistent with the rest of the document and add a short
   positions such as dataclass fields on 3.9.
 - No network calls in `appserver.py` (it shells out to the Codex CLI). `backend.py` is
   the only module that may use `urllib.request`.
-- Never log, print, or serialise raw tokens. When a token must be referenced, show
-  `tok[:8] + "..."` only. `--token-status` prints *derived* facts (expiry, source), not
-  token material.
-  API keys must never appear in output, even as a prefix. Credential storage and
-  the explicit credential export format are the exceptions to serialisation.
+- Never log, print, or serialise token material, **including prefixes**.
+  `--token-status` prints *derived* facts (expiry, source), never any part of a
+  token. Credential storage and the explicit credential export format are the only
+  exceptions to serialisation. Text the program did not write, a subprocess stderr
+  or an HTTP error body, goes through `redaction` before it is quoted: exact
+  replacement of known secrets first, then the regex patterns each module keeps,
+  then a windowed fragment scan that also sees whitespace-split, percent-encoded
+  and JSON-escaped forms. Redact **before** truncating, never after; cutting first
+  leaves half a token that nothing can then recognise. A token re-encoded whole
+  (base64, say) is a documented gap, as is a fragment shorter than nine characters.
+- `backend` follows no redirect that leaves the origin it sent the request to, and
+  no https-to-http downgrade. urllib copies `Authorization` onto redirects.
 - Files containing credentials are written with mode `0o600` on POSIX. On Windows,
   `os.chmod` is mostly a no-op; that is accepted, do not attempt ACL surgery.
 - All writes to shared state go through `paths.atomic_write_*` (temp file in the same
@@ -37,8 +44,16 @@ the simplest behaviour consistent with the rest of the document and add a short
   - a credential is validated (`identity.validate_auth`) before it is written anywhere;
   - a settings value that fails validation is reported as its default, and
     `reset.policy` in `Settings.invalid` disables automatic redemption entirely;
-  - failed process discovery returns `None`, not "nothing is running";
-  - sync-back keeps the newer of two credential copies rather than overwriting blindly.
+  - failed process discovery returns `None`, not "nothing is running", and a
+    command that succeeds while producing nothing parseable counts as failure;
+  - sync-back keeps the newer of two credential copies rather than overwriting
+    blindly, and refuses to write a live file that could not authenticate;
+  - an unreadable `settings.json` or `state.json` is not an empty one: the first
+    marks every key invalid, the second refuses to reserve a redemption;
+  - a probe that failed says nothing about that account headroom, so it cannot be
+    the evidence that every account is exhausted;
+  - a reading whose `accountId` disagrees with the slot registered identity is
+    discarded, not cached (section 3.4).
 
 ---
 
@@ -352,13 +367,21 @@ original is gone. Three rules keep that from happening:
   object carries something Codex can actually authenticate with: `tokens.refresh_token`
   or `tokens.access_token` as a non-empty string, or a non-empty `OPENAI_API_KEY`.
   `identity.load_auth` only proves the file holds a JSON object, which `{}` and
-  `{"hello": 1}` also satisfy. Every path that writes a credential validates first:
-  `switcher.activate` before touching the live home, and `transfer.import_accounts`
-  during its validation pass, before any slot is overwritten by `--force`.
+  `{"hello": 1}` also satisfy. **Every** path that writes a credential validates
+  first: `AccountStore.add_from_auth` (so `add`, `add-token` and `capture_current`
+  are covered at one place), `switcher.capture_current` before it takes the lock,
+  `switcher.sync_live_to_slot` before it writes a slot, `switcher.activate` before
+  touching the live home, and `transfer.import_accounts` during its validation pass.
+  Two of these matter most: re-adding an account matches an existing slot by identity
+  and overwrites it, and sync-back writes the live file into a slot, so an unusable
+  live file could destroy the last working copy of that account's credential.
 - `switcher.detect_running_codex() -> Optional[List[ProcessInfo]]` returns `None` when
   discovery itself failed (missing tool, timeout, malformed output). `activate` treats
   `None` as a refusal requiring `--force`; reporting an empty list would let a switch
-  overwrite the credential a live Codex still holds.
+  overwrite the credential a live Codex still holds. A command that *succeeds* but
+  produces nothing parseable counts as failure: `ps` and `tasklist` always list at
+  least themselves, so zero readable rows means the output was not a process listing.
+  Zero *Codex* rows in a readable listing is still an empty list.
 - `switcher.sync_live_to_slot` compares Codex's `last_refresh` stamp on both copies and
   keeps the newer one. A probe refreshes a slot's own credential, and refresh tokens
   rotate, so blindly copying an older live file over a newer slot file can void the
@@ -376,9 +399,15 @@ save erases the first account and its credential.
 
 Two references must never silently select the wrong account:
 
-- `set_alias` refuses an alias another slot already uses (case-insensitively), and
-  `resolve` raises `UserError` listing the candidates if a registry written by an
-  older build still holds duplicates.
+- `AccountStore._check_alias` refuses an alias another slot already uses
+  (case-insensitively) and every writer calls it: `set_alias`, `add_from_auth` for
+  both the new-slot and the re-add branch, and `add_token`. Re-adding with an alias
+  renames the slot; re-adding without one keeps the alias the slot has.
+- `resolve` raises `UserError` listing the candidates when a reference matches more
+  than one account, for an alias, for an exact email, or for an email prefix.
+  `import` deliberately preserves every entry rather than merging by identity, so one
+  email really can name two slots, and choosing the first would act on an account the
+  user did not name.
 - A directory mapping is a promise that `run` in that directory uses *that account*,
   so `remove`, `move_slot` and `swap_slots` move or drop its mappings. Left behind,
   the mapping would hand the directory to whichever account reuses the slot.
@@ -496,7 +525,17 @@ reset credits. A value that fails validation:
   `True`, so `"false"` is not truthy and `maxPerDay: -1` does not remove the cap;
 - is recorded in `Settings.invalid` (key to rejected value) and named in one stderr
   warning: `warning: ignoring invalid settings, using defaults: <keys>`;
-- is left in the file, so `save()` round-trips it until the user corrects that key.
+- is left in the file, so `save()` round-trips it until the user corrects that key,
+  and `unset(key)` removes it from the file as well as from the overrides. Without
+  that removal `config unset` reports the default and then writes the bad value
+  straight back, so the key could never be cleared.
+
+A document that cannot be read at all is treated the same way, only for every key:
+unparseable JSON, a top-level value that is not an object, and a section written as
+something other than an object all set `invalid` for the keys they cover. An
+unreadable file is not an unset file, and reporting bare defaults would let it
+authorise a redemption under a policy the user never wrote. A **missing** file is
+genuinely unset and leaves `invalid` empty.
 
 `Settings.invalid` exists so that an irreversible action can distinguish "unset" from
 "set to nonsense": see rule 0 in section 6.
@@ -575,29 +614,46 @@ class AutoState:
     cooldown_until: Optional[float] = None
     unhealthy: Dict[int, int] = field(default_factory=dict)          # slot -> consecutive failures
     redemptions: List[Dict[str, Any]] = field(default_factory=list)  # {"at":ts,"slot":n,"creditId":...}
-    def to_dict(self) -> Dict[str, Any]
+    unreadable: bool = False                  # state.json exists but did not parse
+    def to_dict(self) -> Dict[str, Any]       # `unreadable` is not serialised
     @classmethod
     def from_dict(cls, d) -> "AutoState"
     @classmethod
     def load(cls, root: Optional[Path] = None) -> "AutoState"
-    def save(self, root: Optional[Path] = None) -> None
+    def save(self, root: Optional[Path] = None) -> None   # merges `redemptions`
     def redeemed_last_24h(self, now: float) -> int
-    def prune(self, now: float) -> None       # drop redemptions older than 30 days
+    def prune(self, now: float) -> None       # 30 days, then a 200-entry bound
 
 @dataclass(frozen=True)
 class TickResult:
     action: str        # "idle" | "switched" | "redeemed" | "cooldown" | "no-target"
                        # | "probe-failed" | "disabled" | "no-accounts"
+                       # run() also emits "error" and "stopped" for its own loop
     detail: str
     slot: Optional[int] = None
 ```
 
 ```python
 def tick(store, settings, state, *, now: float, probe, redeemer, activator,
-         dry_run: bool = False) -> TickResult
+         dry_run: bool = False, journal: Optional[RedemptionJournal] = None) -> TickResult
 def run(*, once: bool = False, dry_run: bool = False, interval: Optional[int] = None,
-        threshold: Optional[int] = None, log=print) -> int
+        threshold: Optional[int] = None, models: Optional[str] = None, log=print) -> int
 ```
+
+The redemption history is a shared ledger of irreversible acts, so three rules
+protect it beyond the reservation lock:
+
+- `save()` merges `redemptions` with whatever is on disk instead of overwriting it,
+  preferring whichever copy knows an entry's outcome. A daemon that loaded state
+  before another daemon spent a credit would otherwise erase that spend on its next
+  idle tick and hand back the allowance.
+- `prune()` keeps the 30-day window and a 200-entry bound, but never drops an entry
+  the daily cap still counts. A burst of `noCredit` attempts would otherwise push a
+  real spend out of the file; those attempts are themselves droppable, so the bound
+  still holds where it matters.
+- `RedemptionJournal.reserve` refuses when `state.json` exists and did not parse. An
+  unreadable history is not an empty one, and spending against it is spending against
+  a cap whose usage is unknown.
 
 `probe(account) -> UsageSnapshot`, `redeemer(account, credit_id) -> str` and
 `activator(account) -> None` are injected so `tick` is unit-testable with no
@@ -613,13 +669,25 @@ Tick algorithm:
    reaches `autoswitch.unhealthyTicks`, treat the account as unusable and fall through
    to selection. Reset the counter to 0 on any success. A probe failure that has not
    yet reached the threshold returns `("probe-failed", ...)`.
-5. `binding_percent < threshold` gives `("idle", ...)`.
+5. `percent_for(autoswitch.model)` below the threshold gives `("idle", ...)`. With
+   no model named that is `binding_percent`; with one it is the worse of the totals
+   and the selected per-model windows. See section 8.
 6. Compute `alternatives_available` by probing other enabled accounts, respecting
-   `probe.staleSeconds` for cached snapshots.
-7. Ask `resets.decide(...)`. If it says redeem: redeem, drop the slot's cached usage
-   with `store.forget_usage(slot)` (a redemption zeroes both windows and consumes a
-   credit, so every cached number is wrong, not merely stale), append to
-   `state.redemptions`, set cooldown, return `("redeemed", ...)`.
+   `probe.staleSeconds` for cached snapshots. An account counts as headroom when its
+   usage is below the threshold, when its usage is unknown, **and when its probe
+   failed**: a failure says nothing about that account, and the exhausted policy must
+   not spend a credit because a probe timed out. Hysteresis is not applied here; it
+   is a switch-target rule.
+7. Ask `resets.decide(...)`. The decision reads `binding_percent`, not the
+   model-aware percent: a credit clears the account-wide windows, so an exhausted
+   model must not by itself authorise spending one. If it says redeem, write a
+   `"pending"` entry through `RedemptionJournal.reserve` **before** the request
+   leaves, so a crash between the two counts against the cap; a reservation refused
+   by another process falls through to selection. Then redeem, settle the entry with
+   its outcome, and on `reset` only: drop the slot's cached usage with
+   `store.forget_usage(slot)` (a redemption zeroes both windows and consumes a
+   credit, so every cached number is wrong, not merely stale), set cooldown, return
+   `("redeemed", ...)`. Any other outcome is logged and falls through to selection.
 8. Otherwise pick a target with `strategy.pick_target(...)`. None gives
    `("no-target", ...)`.
 9. Activate, set `state.last_switch_at` and `cooldown_until = now + cooldownSeconds`,

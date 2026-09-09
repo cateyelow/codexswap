@@ -16,13 +16,14 @@ import json
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, errors, identity
+from . import __version__, errors, identity, redaction
 from .models import ResetCredit, UsageSnapshot
 
 BASE_URL = "https://chatgpt.com/backend-api"
@@ -32,41 +33,12 @@ OUTCOMES = ("reset", "nothingToReset", "noCredit", "alreadyRedeemed")
 
 # Bounded so that redacting a hostile multi-megabyte body cannot stall the caller;
 # only the first 300 characters ever reach the message anyway.
-_MAX_DETAIL = 4096
+# Never decode an unbounded error body just to quote 300 characters of it. The whole
+# read is redacted before anything is cut, so the bound is on work, not on safety.
+_MAX_READ = 64 * 1024
 # A server-controlled body can echo back part of what we sent, so redacting the whole
-# credential is not enough: a fragment of it is still a credential leak. Nine is the
-# smallest window that leaves ordinary eight-character English words alone.
-_SECRET_WINDOW = 9
-
-
-def _redact_fragments(detail: str, secret: str) -> str:
-    """Blank every span of `detail` that repeats a window of `secret`."""
-    if len(secret) < _SECRET_WINDOW or len(detail) < _SECRET_WINDOW:
-        return detail
-    windows = {secret[i:i + _SECRET_WINDOW] for i in range(len(secret) - _SECRET_WINDOW + 1)}
-    hidden = bytearray(len(detail))
-    for i in range(len(detail) - _SECRET_WINDOW + 1):
-        if detail[i:i + _SECRET_WINDOW] in windows:
-            hidden[i:i + _SECRET_WINDOW] = b"\x01" * _SECRET_WINDOW
-    if not any(hidden):
-        return detail
-    out: List[str] = []
-    index = 0
-    while index < len(detail):
-        if hidden[index]:
-            out.append("[redacted]")
-            while index < len(detail) and hidden[index]:
-                index += 1
-        else:
-            out.append(detail[index])
-            index += 1
-    return "".join(out)
-
-
 def _safe_detail(detail: str, access_token: str, account_id: str = "") -> str:
-    for secret in (access_token, account_id):
-        if secret:
-            detail = detail.replace(secret, "[redacted]")
+    detail = redaction.redact_known(detail, (access_token, account_id))
     detail = re.sub(r"(?i)(\bbearer\s+)[^\s\"'<>]+", r"\1[redacted]", detail)
     detail = re.sub(
         r"(?i)([\"']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|"
@@ -83,8 +55,34 @@ def _safe_detail(detail: str, access_token: str, account_id: str = "") -> str:
     )
     # Last, because every substitution above can leave a partial credential behind.
     for secret in (access_token, account_id):
-        detail = _redact_fragments(detail, secret)
+        detail = redaction.redact_fragments(detail, secret)
     return detail
+
+
+class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect that would carry the bearer token somewhere else.
+
+    urllib copies every header except Content-Length and Content-Type onto the
+    redirected request, so a 302 to another host, or to plain http, would hand the
+    account's access token to whatever answered. These endpoints are undocumented
+    and unsupported; there is no redirect worth following that badly.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlparse(newurl)
+        # Compare with the request we actually sent, not the module constant: the
+        # question is whether this hop keeps the credential where we put it.
+        origin = urllib.parse.urlparse(req.full_url)
+        downgraded = origin.scheme == "https" and target.scheme != "https"
+        if downgraded or target.netloc.casefold() != origin.netloc.casefold():
+            raise errors.BackendError(
+                "The undocumented Codex backend redirected off "
+                f"{origin.netloc}; refusing to forward credentials"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SameOriginRedirects)
 
 
 def _request(
@@ -112,12 +110,16 @@ def _request(
             headers=headers,
             method="POST" if payload is not None else "GET",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            body = exc.read().decode("utf-8", errors="replace")[:_MAX_DETAIL]
+            # Redact first. Truncating first leaves a fragment whose other half is
+            # gone, which no exact or windowed match can then recognise.
+            body = exc.read(_MAX_READ).decode("utf-8", errors="replace")
+            # Redact the whole body, then cut. Cutting first leaves a fragment whose
+            # other half is gone, which no exact or windowed match can recognise.
             detail = _safe_detail(body, access_token, account_id)[:300]
         except (OSError, ValueError):
             pass

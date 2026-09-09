@@ -139,14 +139,27 @@ class Settings:
         if data is missing:
             if settings._path.is_file():
                 print("warning: settings.json is not valid JSON, using defaults", file=sys.stderr)
+                # A file we cannot read is not the same as a file that is not there.
+                # Reporting bare defaults would let an unreadable document authorise a
+                # redemption under a policy the user never wrote, so mark every key
+                # unreadable and let the fail-closed rules see it.
+                settings._unreadable()
             return settings
         # CONTRACT: A settings document must be a nested dict; other JSON shapes use defaults.
         if not isinstance(data, dict):
+            print("warning: settings.json is not a JSON object, using defaults", file=sys.stderr)
+            settings._unreadable()
             return settings
         settings._extra = copy.deepcopy(data)
         for key, spec in SPECS.items():
             group, name = key.split(".", 1)
             section = settings._extra.get(group)
+            if group in settings._extra and not isinstance(section, dict):
+                # `{"reset": "never"}` is a section the user meant to write and we
+                # cannot read. Treat every key under it as unreadable rather than
+                # silently defaulting the whole group.
+                settings.invalid[key] = section
+                continue
             if not isinstance(section, dict) or name not in section:
                 continue
             if not validate(spec, section[name]):
@@ -207,9 +220,25 @@ class Settings:
         self._values[key] = value
         return value
 
+    def _unreadable(self) -> None:
+        """Mark every setting as unreadable, so fail-closed rules can see it."""
+        self.invalid = {key: None for key in SPECS}
+
     def unset(self, key: str) -> None:
         self._spec(key)
         self._values.pop(key, None)
+        # A rejected stored value lives on in _extra so save() round-trips the file.
+        # Without removing it here, `config unset` reports the default and then writes
+        # the bad value straight back, so the setting could never actually be cleared.
+        self.invalid.pop(key, None)
+        group, name = key.split(".", 1)
+        section = self._extra.get(group)
+        if isinstance(section, dict) and name in section:
+            del section[name]
+            if not section:
+                del self._extra[group]
+        elif group in self._extra and not isinstance(section, dict):
+            del self._extra[group]
 
     def items(self) -> List[Tuple[str, Any, bool]]:
         return [(key, self.get(key), self.is_default(key)) for key in SPECS]

@@ -36,12 +36,39 @@ def _timestamp(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def _entry_key(entry: Dict[str, Any]) -> tuple:
+    return (entry.get("attempt"), entry.get("at"), entry.get("slot"), entry.get("creditId"))
+
+
+def _merge_history(
+    stored: List[Dict[str, Any]], mine: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Union two redemption ledgers, preferring whichever copy knows the outcome.
+
+    A settled entry is later information than the same entry still marked pending,
+    so it wins whichever side holds it. Entries only one side has are always kept:
+    losing one would give back allowance that a credit was already spent on.
+    """
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    for entry in list(stored) + list(mine):
+        key = _entry_key(entry)
+        current = merged.get(key)
+        if current is None or (current.get("outcome") == "pending"
+                               and entry.get("outcome") != "pending"):
+            merged[key] = dict(entry)
+    return sorted(merged.values(), key=lambda entry: entry["at"])
+
+
 @dataclass
 class AutoState:
     last_switch_at: Optional[float] = None
     cooldown_until: Optional[float] = None
     unhealthy: Dict[int, int] = field(default_factory=dict)
     redemptions: List[Dict[str, Any]] = field(default_factory=list)
+    # True when state.json exists but could not be read. An empty history and a
+    # history we failed to read look identical otherwise, and the second must never
+    # be allowed to authorise a redemption. Not serialised: it describes this read.
+    unreadable: bool = field(default=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -79,13 +106,26 @@ class AutoState:
     @classmethod
     def load(cls, root: Optional[Path] = None) -> AutoState:
         destination = Path(root) / "state.json" if root is not None else paths.state_path()
-        return cls.from_dict(paths.read_json_tolerant(destination, {}))
+        missing = object()
+        data = paths.read_json_tolerant(destination, missing)
+        if data is missing:
+            state = cls()
+            state.unreadable = destination.exists()
+            return state
+        return cls.from_dict(data)
 
     def save(self, root: Optional[Path] = None) -> None:
         self.prune(time.time())
         destination = Path(root) / "state.json" if root is not None else paths.state_path()
         with FileLock(destination.parent / ".lock"):
-            paths.atomic_write_json(destination, self.to_dict(), mode=0o600, indent=2)
+            # Every other field belongs to this process, but the redemption history is
+            # a shared ledger of irreversible acts. Writing our copy over it would
+            # erase another daemon's spend and hand back its share of the daily cap.
+            document = self.to_dict()
+            document["redemptions"] = _merge_history(
+                AutoState.load(root).redemptions, self.redemptions,
+            )
+            paths.atomic_write_json(destination, document, mode=0o600, indent=2)
 
     def redeemed_last_24h(self, now: float) -> int:
         return sum(
@@ -95,8 +135,22 @@ class AutoState:
         )
 
     def prune(self, now: float) -> None:
-        recent = [entry for entry in self.redemptions if entry["at"] >= now - 30 * _DAY]
-        self.redemptions[:] = sorted(recent, key=lambda entry: entry["at"])[-200:]
+        recent = sorted(
+            (entry for entry in self.redemptions if entry["at"] >= now - 30 * _DAY),
+            key=lambda entry: entry["at"],
+        )
+        # The count cap bounds the file, but it must never evict an entry the daily
+        # cap still counts: a burst of noCredit attempts would otherwise push a real
+        # spend out of the window and hand back allowance already used. Those attempts
+        # are themselves droppable, so the bound still holds in the case it exists for.
+        def counted(entry: Dict[str, Any]) -> bool:
+            return (entry["at"] >= now - _DAY
+                    and entry.get("outcome") not in _UNSPENT_OUTCOMES)
+
+        protected = [entry for entry in recent if counted(entry)]
+        droppable = [entry for entry in recent if not counted(entry)]
+        keep = droppable[-max(0, 200 - len(protected)):] if len(protected) < 200 else []
+        self.redemptions[:] = sorted(protected + keep, key=lambda entry: entry["at"])
 
 
 class RedemptionJournal:
@@ -123,15 +177,10 @@ class RedemptionJournal:
         return FileLock(paths.state_path().parent / ".lock" if self.root is None
                         else Path(self.root) / ".lock")
 
-    @staticmethod
-    def _key(entry: Dict[str, Any]) -> tuple:
-        return (entry.get("attempt"), entry.get("at"), entry.get("slot"),
-                entry.get("creditId"))
-
     def _adopt_other_processes(self) -> None:
-        known = {self._key(entry) for entry in self.state.redemptions}
+        known = {_entry_key(entry) for entry in self.state.redemptions}
         for entry in AutoState.load(self.root).redemptions:
-            if self._key(entry) not in known:
+            if _entry_key(entry) not in known:
                 self.state.redemptions.append(dict(entry))
 
     def reserve(self, entry: Dict[str, Any], *, cap: int, now: float) -> bool:
@@ -140,6 +189,11 @@ class RedemptionJournal:
             self.state.redemptions.append(entry)
             return True
         with self._lock():
+            if AutoState.load(self.root).unreadable:
+                # A history we cannot read is not an empty history. Spending against
+                # it would be spending against a cap whose usage is unknown.
+                _logger.warning("state.json is unreadable; refusing to redeem")
+                return False
             self._adopt_other_processes()
             if cap > 0 and self.state.redeemed_last_24h(now) >= cap:
                 return False
@@ -226,6 +280,7 @@ def tick(
 
     # 6. Prefer fresh cached snapshots when considering other enabled accounts.
     candidates: List[strategy.Candidate] = []
+    unknown_alternatives = False
     for account in accounts:
         if account.slot == active_slot:
             continue
@@ -238,6 +293,9 @@ def tick(
             except (errors.CodexSwapError, OSError):
                 # CONTRACT: Failed probes are excluded; a successful probe with
                 # unknown usage is still eligible under the selection strategy.
+                # For the reset policy the failure means "unknown", not "exhausted":
+                # spending a credit because a probe timed out is spending on a guess.
+                unknown_alternatives = True
                 continue
             if not dry_run:
                 store.record_usage(account.slot, snapshot)
@@ -247,7 +305,7 @@ def tick(
     # which is the plain threshold. Hysteresis is a switch-target rule, and applying it
     # here spent a credit while an account at 75% sat idle under a threshold of 80.
     # Unknown usage counts as headroom: never spend a credit on a maybe.
-    alternatives_available = any(
+    alternatives_available = unknown_alternatives or any(
         candidate.percent is None or candidate.percent < settings.threshold
         for candidate in candidates
     )
@@ -333,9 +391,15 @@ class _AutoAccounts:
 
     def cached_usage(self, slot, **kwargs):
         # Always re-evaluate API-key eligibility; they have no real usage cache.
-        if self.store.get(slot).identity.auth_mode == "apikey":
+        account = self.store.get(slot)
+        if account.identity.auth_mode == "apikey":
             return None
-        return self.readings.get(slot) or self.store.cached_usage(slot, **kwargs)
+        snapshot = self.readings.get(slot) or self.store.cached_usage(slot, **kwargs)
+        # A cached reading gets the same identity check a fresh probe gets; otherwise
+        # the daemon decides about a slot using another account's numbers.
+        if snapshot is not None and not snapshot.describes(account.identity):
+            return None
+        return snapshot
 
     def probe(self, account):
         from . import appserver, strategy
@@ -373,7 +437,8 @@ class _AutoAccounts:
                         snapshot = self.probe(other)
                     except (errors.CodexSwapError, OSError):
                         continue
-                if strategy.eligible(strategy.Candidate(other, snapshot),
+                candidate = strategy.Candidate(other, snapshot, self.settings.models)
+                if strategy.eligible(candidate,
                                      current_slot=self.store.active_slot,
                                      threshold=self.settings.threshold,
                                      hysteresis=self.settings.hysteresis_pct):

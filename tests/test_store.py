@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 from conftest import RATE_LIMITS_RESULT, make_auth
@@ -32,7 +33,8 @@ def test_readding_account_refreshes_identity_and_preserves_metadata():
 
     assert list(store.accounts) == [1]
     assert updated.slot == original.slot
-    assert (updated.alias, updated.disabled, updated.added_at) == ("main", True, added_at)
+    # An alias the user typed is applied; the slot keeps everything they did not.
+    assert (updated.alias, updated.disabled, updated.added_at) == ("replacement", True, added_at)
     assert added_at
     assert updated.identity.account_id == "acct-1"
     assert updated.identity.email == "updated@example.com"
@@ -273,3 +275,56 @@ def test_directory_mappings_follow_the_account_not_the_slot(tmp_path):
     # Not left pointing at 7: the next account added there would inherit the promise.
     assert mappings.lookup(first) is None
     assert mappings.lookup(second) == 1
+
+
+def test_readding_without_an_alias_keeps_the_one_the_slot_has():
+    store = AccountStore.load()
+    add_account(store, 1, alias="main")
+
+    updated = store.add_from_auth(
+        make_auth(account_id="acct-1", email="a1@example.com"), now=NOW + 60)
+
+    assert updated.alias == "main"
+
+
+def test_readding_cannot_steal_an_alias_from_another_slot():
+    store = AccountStore.load()
+    add_account(store, 1, alias="main")
+    add_account(store, 2, alias="backup")
+
+    with pytest.raises(errors.UserError, match="already used by slot 1"):
+        store.add_from_auth(make_auth(account_id="acct-2", email="a2@example.com"),
+                            alias="MAIN", now=NOW + 60)
+
+    assert AccountStore.load().get(2).alias == "backup"
+
+
+def test_add_refuses_an_alias_another_slot_already_uses():
+    store = AccountStore.load()
+    add_account(store, 1, alias="work")
+
+    with pytest.raises(errors.UserError, match="already used by slot 1"):
+        add_account(store, 2, alias="WORK")
+
+    assert list(AccountStore.load().accounts) == [1]
+
+
+def test_add_token_refuses_a_duplicate_alias():
+    store = AccountStore.load()
+    add_account(store, 1, alias="work")
+
+    with pytest.raises(errors.UserError, match="already used by slot 1"):
+        store.add_token("opaque-token-value", alias="work")
+
+    assert list(AccountStore.load().accounts) == [1]
+
+
+def test_an_email_naming_two_slots_is_ambiguous_rather_than_the_first():
+    store = AccountStore.load()
+    add_account(store, 1, alias="one")
+    # Only import can produce this; add deduplicates by identity.
+    store.accounts[2] = replace(store.get(1), slot=2, alias="two")
+    store.save()
+
+    with pytest.raises(errors.UserError, match="Ambiguous account email"):
+        AccountStore.load().resolve("person1@example.com")

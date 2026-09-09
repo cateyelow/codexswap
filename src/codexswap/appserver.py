@@ -21,7 +21,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, TextIO, Union
 
-from . import paths
+from . import paths, redaction
 from .errors import AppServerError, AppServerTimeout, AuthExpired, CodexBinaryNotFound
 from .models import UsageSnapshot
 
@@ -147,14 +147,28 @@ class AppServerClient:
                     )
                 self._secrets.update(value for value in values if isinstance(value, str) and value)
 
-    def _safe_message(self, message: str) -> str:
-        self._remember_credentials()
-        for secret in sorted(self._secrets, key=len, reverse=True):
-            message = message.replace(secret, "[redacted]")
-        return _CREDENTIAL.sub(
+    def _redact(self, message: str) -> str:
+        """Remove every credential this client already knows about.
+
+        Separate from `_safe_message` because the stderr reader runs this on each
+        chunk, and re-reading auth.json once per kilobyte of output would be absurd.
+        A token that rotates mid-run stays raw in the tail until the final
+        `_safe_message` pass, which refreshes the set and redacts the whole thing.
+        """
+        message = redaction.redact_known(message, self._secrets)
+        message = _CREDENTIAL.sub(
             lambda match: (match.group(1) or match.group(2) or "") + "[redacted]",
             message,
         )
+        # Last: a token echoed back truncated, split, or percent-encoded survives
+        # every substitution above, and a fragment of a credential is still one.
+        for secret in self._secrets:
+            message = redaction.redact_fragments(message, secret)
+        return message
+
+    def _safe_message(self, message: str) -> str:
+        self._remember_credentials()
+        return self._redact(message)
 
     def __enter__(self) -> AppServerClient:
         if self._process is not None:
@@ -245,8 +259,9 @@ class AppServerClient:
                 combined = self._stderr_tail + chunk
                 if any(marker in combined.lower() for marker in _AUTH_MARKERS):
                     self._auth_failure = True
-                # Retain enough context to redact tokens before taking the last 500 chars.
-                self._stderr_tail = combined[-16384:]
+                # Redact before dropping the head. Cutting first leaves the tail end of
+                # a token whose other half is gone, which nothing can then recognise.
+                self._stderr_tail = self._redact(combined)[-16384:]
         except (OSError, ValueError):
             pass
 

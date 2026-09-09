@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from codexswap import errors
+from codexswap import errors, paths
 from codexswap.settings import SPECS, Settings
 
 # CONTRACT section 5: this table deliberately does not derive values from SPECS.
@@ -278,3 +278,61 @@ def test_set_accepts_any_string_for_a_free_form_setting(raw):
 
     assert settings.set("autoswitch.model", raw) == raw
     assert settings.get("autoswitch.model") == raw
+
+
+@pytest.mark.parametrize("contents,description", [
+    ("{ truncated", "unparseable JSON"),
+    ('["a", "list"]', "a JSON document that is not an object"),
+    ('{"reset": "never"}', "a section written as a bare string"),
+    ('{"reset": ["never"]}', "a section written as a list"),
+])
+def test_an_unreadable_document_marks_every_reset_key_invalid(contents, description, capsys):
+    swap_home = paths.codexswap_home()
+    swap_home.mkdir(parents=True, exist_ok=True)
+    (swap_home / "settings.json").write_text(contents, encoding="utf-8")
+
+    settings = Settings.load()
+
+    # get() still reports the default, because something has to be returned. What
+    # must not happen is a caller mistaking that default for the user's choice: the
+    # reset rules read `invalid` before spending anything irreversible.
+    assert settings.reset_policy == "expiring"
+    assert "reset.policy" in settings.invalid, description
+    assert "warning" in capsys.readouterr().err
+
+
+def test_a_missing_document_is_not_marked_invalid():
+    settings = Settings.load()
+
+    assert settings.invalid == {}
+    assert settings.reset_policy == "expiring"
+
+
+def test_unset_clears_a_stored_value_the_loader_rejected():
+    swap_home = paths.codexswap_home()
+    swap_home.mkdir(parents=True, exist_ok=True)
+    path = swap_home / "settings.json"
+    path.write_text('{"reset": {"policy": "sometimes", "maxPerDay": 2}}', encoding="utf-8")
+    settings = Settings.load()
+    assert settings.invalid == {"reset.policy": "sometimes"}
+
+    settings.unset("reset.policy")
+    settings.save()
+
+    reloaded = Settings.load()
+    assert reloaded.invalid == {}
+    assert reloaded.reset_policy == "expiring"
+    # The keys the user got right are untouched.
+    assert reloaded.reset_max_per_day == 2
+
+
+def test_unset_removes_a_whole_unreadable_section():
+    swap_home = paths.codexswap_home()
+    swap_home.mkdir(parents=True, exist_ok=True)
+    (swap_home / "settings.json").write_text('{"reset": "never"}', encoding="utf-8")
+    settings = Settings.load()
+
+    settings.unset("reset.policy")
+    settings.save()
+
+    assert Settings.load().invalid == {}

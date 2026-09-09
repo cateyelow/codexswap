@@ -90,14 +90,22 @@ def _process_output(command: List[str]) -> str:
 def _windows_processes() -> List[ProcessInfo]:
     output = _process_output(["tasklist", "/FO", "CSV", "/NH"])
     processes: Dict[int, ProcessInfo] = {}
+    rows_understood = 0
     for row in csv.reader(io.StringIO(output)):
-        if len(row) < 2 or row[0].strip().casefold() != "codex.exe":
+        if len(row) < 2:
             continue
         try:
             pid = int(row[1].strip().replace(",", ""))
         except ValueError:
             continue
+        rows_understood += 1
+        if row[0].strip().casefold() != "codex.exe":
+            continue
         processes[pid] = ProcessInfo(pid, row[0].strip(), "")
+    if not rows_understood:
+        # tasklist always lists at least itself. Zero readable rows means the output
+        # was not a task listing, and "no Codex is running" would be a guess.
+        raise OSError("tasklist produced no readable rows")
     try:
         output = _process_output(
             ["wmic", "process", "get", "ProcessId,Name,CommandLine", "/format:csv"]
@@ -171,6 +179,7 @@ def detect_running_codex() -> Optional[List[ProcessInfo]]:
                     continue
         excluded = _ancestors(parents)
         processes = []
+        rows_understood = 0
         for line in output.splitlines():
             parts = line.strip().split(None, 2)
             if len(parts) < 2:
@@ -179,11 +188,16 @@ def detect_running_codex() -> Optional[List[ProcessInfo]]:
                 pid = int(parts[0])
             except ValueError:
                 continue
+            rows_understood += 1
             name = os.path.basename(parts[1])
             cmdline = parts[2] if len(parts) == 3 else ""
             if (pid > 0 and pid not in excluded and name.casefold() in ("codex", "codex.exe")
                     and "app-server" not in cmdline.casefold()):
                 processes.append(ProcessInfo(pid, name, cmdline))
+        if not rows_understood:
+            # ps always lists at least itself. Zero readable rows means the command
+            # answered with something that is not a process listing.
+            raise OSError("ps produced no readable rows")
         return sorted(processes, key=lambda process: process.pid)
     except Exception:
         # A missing tool, a timeout or malformed output means the answer is unknown.
@@ -237,6 +251,10 @@ def capture_current(
         auth = identity.load_auth(paths.live_auth_path())
     except errors.AuthFileMissing:
         raise errors.AuthFileMissing("No live authentication file; run codex login first") from None
+    # CONTRACT: no credential write without a usable credential. Capturing an auth
+    # file that cannot authenticate would register a slot that can never be switched
+    # to, and re-capturing over a working slot would destroy the working copy.
+    identity.validate_auth(auth, source="the live authentication file")
     with FileLock(store.path_for(paths.lock_path())):
         account = store.add_from_auth(auth, slot=slot, alias=alias)
         # Capture reads the LIVE credential, so the captured account is by definition
@@ -256,6 +274,13 @@ def sync_live_to_slot(store: AccountStore) -> Optional[int]:
         try:
             auth = identity.load_auth(paths.live_auth_path())
         except errors.AuthFileMissing:
+            return None
+        try:
+            # Sync-back exists to preserve a refreshed credential. An unusable live
+            # file has nothing to preserve, and writing it would destroy the slot's
+            # own working copy, which may be the only one left.
+            identity.validate_auth(auth, source="the live authentication file")
+        except errors.AuthFileInvalid:
             return None
         derived = identity.identity_from_auth(auth)
         account = (store.find_by_account_id(derived.account_id)

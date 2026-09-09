@@ -203,7 +203,7 @@ def _cached_all(store, settings, accounts) -> Dict[int, Tuple[Optional[UsageSnap
     return usages
 
 
-def _backend_fallback(store, account, settings, results, auth_failed):
+def _backend_fallback(store, account, settings, results, auth_failed, mismatched=None):
     """Last resort for one account, reachable only through the explicit opt-in."""
     from . import backend
 
@@ -218,6 +218,10 @@ def _backend_fallback(store, account, settings, results, auth_failed):
         pass
     else:
         if not snapshot.describes(account.identity):
+            # Same rule as the supported path: the reading is somebody else's, and
+            # the commands that refuse on a mismatch have to be told about it.
+            if mismatched is not None:
+                mismatched.add(account.slot)
             return
         results[account.slot] = (snapshot, False)
         store.record_usage(account.slot, snapshot)
@@ -265,8 +269,10 @@ def _probe_all(store, settings, *, accounts, force=False, auth_failed=None,
                     if not snapshot.describes(account.identity):
                         # The slot home holds a different account than the registry
                         # says. Caching this would attribute usage to the wrong
-                        # person; keep whatever was there and let doctor explain.
+                        # person, and the cached reading it would fall back to is now
+                        # known to describe a slot whose contents have changed.
                         mismatched.add(account.slot)
+                        results[account.slot] = (None, False)
                         continue
                     results[account.slot] = (snapshot, False)
                     # Serialize registry/cache writes on the calling thread.
@@ -280,7 +286,8 @@ def _probe_all(store, settings, *, accounts, force=False, auth_failed=None,
                 except Exception:
                     # Do not surface subprocess diagnostics that could contain tokens.
                     if allow_backend or settings.allow_backend_fallback:
-                        _backend_fallback(store, account, settings, results, auth_failed)
+                        _backend_fallback(store, account, settings, results, auth_failed,
+                                          mismatched)
                     continue
     except Exception:
         # Missing binaries, executor failures, and unreadable caches degrade output.

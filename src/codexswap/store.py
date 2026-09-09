@@ -132,9 +132,17 @@ class AccountStore:
             # redeem against an account the user did not name.
             candidates = ", ".join(f"{a.slot}: {a.identity.label()}" for a in aliased)
             raise errors.UserError("Ambiguous alias. Candidates: " + candidates)
-        account = self.find_by_email(value)
-        if account is not None:
-            return account
+        exact = [account for account in self.ordered()
+                 if account.identity.email is not None
+                 and account.identity.email.casefold() == folded]
+        if len(exact) == 1:
+            return exact[0]
+        if exact:
+            # `import` deliberately preserves every entry rather than merging by
+            # identity, so one email really can name two slots. Choosing the first
+            # would switch, run or redeem against an account the user did not name.
+            candidates = ", ".join(f"{a.slot}: {a.identity.label()}" for a in exact)
+            raise errors.UserError("Ambiguous account email. Candidates: " + candidates)
         matches = [account for account in self.ordered()
                    if folded and account.identity.email is not None
                    and account.identity.email.casefold().startswith(folded)]
@@ -157,6 +165,10 @@ class AccountStore:
     ) -> Account:
         if slot is not None:
             self._validate_slot(slot)
+        # CONTRACT: never write a credential file that could not authenticate. An
+        # unusable payload here would take over an existing slot by identity match
+        # and overwrite the working credential that slot already had.
+        identity.validate_auth(auth)
         derived = identity.identity_from_auth(auth)
         with FileLock(self.path_for(paths.lock_path())):
             self.reload()
@@ -166,10 +178,16 @@ class AccountStore:
                 existing = self.find_by_email(derived.email)
             if existing is not None:
                 account = existing
+                if alias is not None:
+                    # Re-adding with --alias renames the slot. Ignoring it silently
+                    # left the user staring at the old name after a successful add.
+                    self._check_alias(alias, slot=account.slot)
+                    account.alias = alias
             else:
                 slot = self.next_free_slot() if slot is None else slot
                 if slot in self.accounts:
                     raise errors.SlotInUse(f"Slot {slot} is already in use")
+                self._check_alias(alias, slot=None)
                 # CONTRACT: addedAt uses iso_now(); now does not alter its format.
                 account = Account(slot=slot, identity=derived, alias=alias,
                                   added_at=paths.iso_now())
@@ -252,6 +270,7 @@ class AccountStore:
                 raise errors.UserError("An account with that email already exists")
             auth = {"auth_mode": "apikey", "OPENAI_API_KEY": token, "tokens": None}
             derived = replace(identity.identity_from_auth(auth), email=email, plan_type="api key")
+            self._check_alias(alias, slot=None)
             account = Account(slot=slot, identity=derived, alias=alias, added_at=paths.iso_now())
             self.seed_config(slot)
             paths.atomic_write_json(self._checked_home(slot) / "auth.json", auth, mode=0o600)
@@ -283,20 +302,30 @@ class AccountStore:
             self.save()
             return account
 
+    def _check_alias(self, alias: Optional[str], *, slot: Optional[int]) -> None:
+        """Refuse an alias another slot already answers to. Callers hold the lock.
+
+        An alias is a promise that one word names one account, and `resolve` cannot
+        keep that promise after two slots have claimed the same word. Every path that
+        writes an alias checks here, not only `alias` itself.
+        """
+        if alias is None:
+            return
+        folded = alias.casefold()
+        clash = next((other for other in self.ordered()
+                      if other.slot != slot and other.alias is not None
+                      and other.alias.casefold() == folded), None)
+        if clash is not None:
+            raise errors.UserError(
+                f"Alias is already used by slot {clash.slot}; "
+                "aliases must identify one account"
+            )
+
     def set_alias(self, slot: int, alias: Optional[str]) -> Account:
         with FileLock(self.path_for(paths.lock_path())):
             self.reload()
             account = self.get(slot)
-            if alias is not None:
-                folded = alias.casefold()
-                clash = next((other for other in self.ordered()
-                              if other.slot != slot and other.alias is not None
-                              and other.alias.casefold() == folded), None)
-                if clash is not None:
-                    raise errors.UserError(
-                        f"Alias is already used by slot {clash.slot}; "
-                        "aliases must identify one account"
-                    )
+            self._check_alias(alias, slot=slot)
             account.alias = alias
             self.save()
             return account

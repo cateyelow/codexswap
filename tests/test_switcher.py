@@ -189,3 +189,29 @@ def test_run_as_passes_argv_and_slot_environment_without_changing_live(live_auth
     assert env["CODEXSWAP_TEST_MARKER"] == "preserved"
     assert live_path.read_bytes() == before
     assert store.active_slot is None
+
+
+def test_unparsable_process_output_reports_unknown_not_empty(monkeypatch):
+    class Completed:
+        returncode, stdout, stderr = 0, "this is not a process listing\n", ""
+
+    monkeypatch.setattr(switcher.subprocess, "run", lambda *a, **k: Completed())
+
+    # A command that succeeds but says nothing we understand is not evidence that no
+    # Codex is running; reporting [] here would let a switch overwrite a live token.
+    assert switcher.detect_running_codex() is None
+
+
+def test_a_listing_with_no_codex_rows_still_reports_empty(monkeypatch):
+    listing = "  1 systemd /sbin/init\n 42 bash -l\n"
+    ancestry = "1 0\n42 1\n"
+    outputs = iter([listing, ancestry])
+
+    class Completed:
+        def __init__(self, stdout):
+            self.returncode, self.stdout, self.stderr = 0, stdout, ""
+
+    monkeypatch.setattr(switcher.os, "name", "posix")
+    monkeypatch.setattr(switcher.subprocess, "run", lambda *a, **k: Completed(next(outputs)))
+
+    assert switcher.detect_running_codex() == []

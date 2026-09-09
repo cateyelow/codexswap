@@ -9,6 +9,7 @@ import sys
 import sysconfig
 import threading
 import time
+import urllib.request
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -495,3 +496,32 @@ def test_module_docstring_explains_unsupported_opt_in_endpoints():
     assert "unsupported" in doc
     assert "--backend" in doc
     assert "probe.allowbackendfallback" in doc
+
+
+# urllib copies every header except Content-Length and Content-Type onto a redirect,
+# so an unchecked hop hands the account's bearer token to whoever answered.
+SENT = "https://chatgpt.example/backend-api/wham/usage"
+
+
+@pytest.mark.parametrize("newurl", [
+    "https://elsewhere.invalid/collect",
+    "http://chatgpt.example/backend-api/wham/usage",
+    "https://chatgpt.example.evil/backend-api/wham/usage",
+])
+def test_a_redirect_that_moves_the_credential_is_refused(newurl):
+    handler = backend._SameOriginRedirects()
+    request = urllib.request.Request(
+        SENT, headers={"Authorization": "Bearer synthetic-token-value"})
+
+    with pytest.raises(errors.BackendError, match="refusing to forward credentials"):
+        handler.redirect_request(request, None, 302, "Found", {}, newurl)
+
+
+def test_a_redirect_within_the_same_origin_is_allowed():
+    handler = backend._SameOriginRedirects()
+    request = urllib.request.Request(SENT)
+
+    followed = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://chatgpt.example/backend-api/other")
+
+    assert followed is not None

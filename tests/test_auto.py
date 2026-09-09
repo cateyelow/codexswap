@@ -261,14 +261,31 @@ def test_prune_drops_40_day_old_entries():
 
 
 def test_prune_clamps_long_history_and_retains_newest():
-    entries = [{"at": NOW - index, "slot": 1, "creditId": str(index)} for index in range(2000)]
+    # Spread over the retention window, so the count cap is the thing being tested.
+    entries = [{"at": NOW - index * 1000, "slot": 1, "creditId": str(index)}
+               for index in range(2000)]
     state = auto.AutoState(redemptions=entries.copy())
     state.prune(now=NOW)
     assert 0 < len(state.redemptions) < len(entries)
+    assert state.redemptions[-1]["creditId"] == "0"
     assert entries[0] in state.redemptions
     assert {entry["creditId"] for entry in state.redemptions} == {
         str(index) for index in range(len(state.redemptions))
     }
+
+
+def test_prune_never_drops_a_spend_the_daily_cap_still_counts():
+    spend = {"at": NOW - 100, "slot": 1, "creditId": "spent", "outcome": "reset"}
+    noise = [{"at": NOW - 90 + index, "slot": 1, "creditId": str(index),
+              "outcome": "noCredit"} for index in range(400)]
+    state = auto.AutoState(redemptions=[spend] + noise)
+
+    state.prune(now=NOW)
+
+    assert state.redeemed_last_24h(NOW) == 1
+    assert spend in state.redemptions
+    # The bound still holds, because the attempts that do not count are droppable.
+    assert len(state.redemptions) <= 201
 
 
 def test_format_tick_is_a_stable_single_line():
@@ -454,3 +471,98 @@ def test_a_mismatched_active_account_never_redeems(scenario, monkeypatch):
     # The first refusal is a probe failure, so the credit decision is never reached.
     assert result.action == "probe-failed"
     assert scenario.state.unhealthy[1] == 1
+
+
+def _reserve(journal, *, at, slot, credit, cap, now):
+    entry = {"at": at, "slot": slot, "creditId": credit,
+             "attempt": f"attempt-{credit}", "outcome": "pending"}
+    return entry, journal.reserve(entry, cap=cap, now=now)
+
+
+def test_a_stale_save_cannot_erase_another_processes_spend(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    a = auto.AutoState.load(root)
+    b = auto.AutoState.load(root)          # loaded before A reserved anything
+    journal_a = auto.RedemptionJournal(a, root=root, persist=True)
+
+    entry, reserved = _reserve(journal_a, at=NOW, slot=1, credit="c1", cap=1, now=NOW)
+    assert reserved
+    entry["outcome"] = "reset"
+    journal_a.settle(entry)
+    assert auto.AutoState.load(root).redeemed_last_24h(NOW) == 1
+
+    # B finishes its own tick and writes the state it loaded before A spent.
+    b.save(root)
+
+    assert auto.AutoState.load(root).redeemed_last_24h(NOW) == 1
+    journal_b = auto.RedemptionJournal(auto.AutoState.load(root), root=root, persist=True)
+    _, second = _reserve(journal_b, at=NOW + 1, slot=2, credit="c2", cap=1, now=NOW + 1)
+    assert second is False
+
+
+def test_a_settled_outcome_survives_a_concurrent_save(tmp_path):
+    root = tmp_path / "outcome"
+    root.mkdir()
+    a = auto.AutoState.load(root)
+    journal_a = auto.RedemptionJournal(a, root=root, persist=True)
+    entry, _ = _reserve(journal_a, at=NOW, slot=1, credit="c1", cap=2, now=NOW)
+
+    # B adopts the pending entry and reserves its own before A learns the outcome.
+    b = auto.AutoState.load(root)
+    journal_b = auto.RedemptionJournal(b, root=root, persist=True)
+    _, second = _reserve(journal_b, at=NOW + 1, slot=2, credit="c2", cap=2, now=NOW + 1)
+    assert second
+
+    entry["outcome"] = "reset"
+    journal_a.settle(entry)
+
+    stored = auto.AutoState.load(root)
+    outcomes = {item["creditId"]: item["outcome"] for item in stored.redemptions}
+    assert outcomes == {"c1": "reset", "c2": "pending"}
+
+
+def test_an_unreadable_history_refuses_to_reserve(tmp_path):
+    root = tmp_path / "unreadable"
+    root.mkdir()
+    (root / "state.json").write_text("{ truncated", encoding="utf-8")
+    state = auto.AutoState.load(root)
+    assert state.unreadable is True
+
+    journal = auto.RedemptionJournal(state, root=root, persist=True)
+    _, reserved = _reserve(journal, at=NOW, slot=1, credit="c1", cap=1, now=NOW)
+
+    assert reserved is False
+
+
+def test_a_missing_history_is_not_treated_as_unreadable(tmp_path):
+    root = tmp_path / "absent"
+    root.mkdir()
+
+    assert auto.AutoState.load(root).unreadable is False
+
+
+def test_a_failed_alternative_probe_is_headroom_not_exhaustion(scenario):
+    scenario.settings.set("reset.policy", "exhausted")
+    scenario.settings.set("reset.minUsagePercent", "0")
+    scenario.snapshots[1] = usage(99)
+    scenario.snapshots[2] = errors.AppServerError("probe timed out")
+
+    result = scenario.tick(now=NOW)
+
+    # The other account may well have quota; nobody knows. A credit is not spent on
+    # a guess, so the tick reports that it has nowhere to switch instead.
+    assert scenario.redeemed == []
+    assert result.action == "no-target"
+
+
+def test_an_exhausted_alternative_still_permits_the_exhausted_policy(scenario):
+    scenario.settings.set("reset.policy", "exhausted")
+    scenario.settings.set("reset.minUsagePercent", "0")
+    scenario.snapshots[1] = usage(99)
+    scenario.snapshots[2] = usage(99)
+
+    result = scenario.tick(now=NOW)
+
+    assert result.action == "redeemed"
+    assert [slot for slot, _ in scenario.redeemed] == [1]
